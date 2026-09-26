@@ -698,8 +698,10 @@ def scenario_big_endian(rng) -> tuple[TdmsBuilder, dict]:
 
 
 def scenario_all_dtypes(rng) -> tuple[TdmsBuilder, dict]:
-    """All numeric types, strings, timestamps, empty channels, in two segments.
+    """All numeric types, strings, timestamps and empty channels.
 
+    Strings are in their own segments: fastread refuses segments with
+    unsized (string) data, see scenario_strings_mixed.
     No Void channel here: npTDMS TdmsFile.read fails on Void raw data.
     """
     b = TdmsBuilder()
@@ -707,18 +709,33 @@ def scenario_all_dtypes(rng) -> tuple[TdmsBuilder, dict]:
     objs = header_objects([G, "Other"])
     for dt in NUMERIC_DTYPES:
         objs.append(Obj(_p("t_" + dt), random_values(dt, n, rng)))
-    objs.append(Obj(_p("text"), random_strings(n, rng)))
     objs.append(Obj(_p("time"), random_times(n, rng)))
     objs.append(Obj(_p("empty_i32"), np.empty(0, np.int32), type_code=T_I32))
     objs.append(Obj(_p("no_data"), props={"note": "never has data"}))
     b.segment(objs)
-    objs = [Obj(_p("t_" + dt), random_values(dt, n // 2, rng)) for dt in NUMERIC_DTYPES]
-    objs.append(Obj(_p("text"), random_strings(n // 2, rng)))
-    objs.append(Obj(_p("time"), random_times(n // 2, rng, start="2026-07-29T00:00:00")))
-    b.segment(objs, new_obj_list=False)
+    b.segment([Obj(_p("text"), random_strings(n, rng))])
+    objs = [Obj(_p("t_" + dt), index="same") for dt in NUMERIC_DTYPES]
+    objs.append(Obj(_p("time"), index="same"))
+    data = {_p("t_" + dt): random_values(dt, n, rng) for dt in NUMERIC_DTYPES}
+    data[_p("time")] = random_times(n, rng, start="2026-07-29T00:00:00")
+    b.segment(objs, data=data)
+    b.segment([Obj(_p("text"), random_strings(n // 2, rng))])
     fast = {_p("t_" + dt): True for dt in NUMERIC_DTYPES}
     fast.update({_p("text"): False, _p("time"): False, _p("empty_i32"): False, _p("no_data"): False})
     return b, {"fast": fast}
+
+
+def scenario_strings_mixed(rng) -> tuple[TdmsBuilder, dict]:
+    """Numeric and string channels in the same segments (fast flag not checked)."""
+    b = TdmsBuilder()
+    n = 200
+    objs = header_objects([G]) + [Obj(_p("num_before"), random_values("f8", n, rng)),
+                                  Obj(_p("words"), random_strings(n, rng)),
+                                  Obj(_p("num_after"), random_values("i2", n, rng))]
+    b.segment(objs)
+    b.segment([Obj(_p("num_before"), random_values("f8", n, rng)), Obj(_p("words"), random_strings(n, rng)),
+               Obj(_p("num_after"), random_values("i2", n, rng))])
+    return b, {"fast": {_p("words"): False}}
 
 
 def scenario_raw_only(rng) -> tuple[TdmsBuilder, dict]:
@@ -881,6 +898,7 @@ SCENARIOS = {
     "interleaved_be": lambda rng: scenario_interleaved(rng, big_endian=True),
     "big_endian": scenario_big_endian,
     "all_dtypes": scenario_all_dtypes,
+    "strings_mixed": scenario_strings_mixed,
     "raw_only": scenario_raw_only,
     "growing": scenario_growing,
     "scaled": scenario_scaled,

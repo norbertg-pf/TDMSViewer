@@ -282,6 +282,20 @@ def nan_equal(a, b) -> bool:
     return a.shape == b.shape and bool(np.all((a == b) | (np.isnan(a) & np.isnan(b))))
 
 
+def same_values(a, b) -> bool:
+    """Exact equality of native channel values (NaN equal to NaN)."""
+    a, b = np.asarray(a), np.asarray(b)
+    if a.shape != b.shape:
+        return False
+    if a.dtype.kind in "OUS" or b.dtype.kind in "OUS":
+        return list(a) == list(b)
+    if a.dtype.kind == "M" or b.dtype.kind == "M":
+        return a.dtype == b.dtype and bool(np.array_equal(a, b))
+    if a.dtype.kind == "c" or b.dtype.kind == "c":
+        return nan_equal(a.real, b.real) and nan_equal(a.imag, b.imag)
+    return nan_equal(a, b)
+
+
 def bucket_edges(centers_idx: np.ndarray, i0: int) -> np.ndarray:
     """Bucket edges from bucket centers (index units), first edge i0.
 
