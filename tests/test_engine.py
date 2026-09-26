@@ -32,6 +32,7 @@ from engine_helpers import (  # noqa: E402
     split_channels, time_to_seconds, write_interleaved, write_segments,
 )
 from tdmsviewer import engine as eng_mod  # noqa: E402
+from tdmsviewer.engine import absolute_stats  # noqa: E402
 from tdmsviewer.engine import (  # noqa: E402
     DataEngine, PlotItem, PlotRequest, StatsRequest, TableRequest,
 )
@@ -261,7 +262,11 @@ def check_stats(res, samples, native, xm, xa, xb, s, e, cursors=()):
         assert res["stats"].n == 0
     else:
         assert (i0, i1) == rng_
-        assert_stats(res["stats"], ref_stats(samples[i0:i1]))
+        assert_stats(absolute_stats(res), ref_stats(samples[i0:i1]))
+        if res.get("offset") is not None and res["stats"].n:  # int64/uint64: exact integers
+            nat = native[i0:i1]
+            assert res["offset"] + int(res["stats"].min) == int(nat.min())
+            assert res["offset"] + int(res["stats"].max) == int(nat.max())
     assert len(res["cursors"]) == len(cursors)
     if isinstance(xm, ArrayMap):
         e = min(e, xm.x.size)

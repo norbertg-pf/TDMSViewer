@@ -937,6 +937,20 @@ class DataEngine(QObject):
                     pass
 
 
+def absolute_stats(res: dict):
+    """Stats of a stats result with the int64/uint64 offset added back (float).
+
+    Min/max above 2**53 are rounded here; use res["offset"] + stats.min for
+    the exact integer.
+    """
+    st = res.get("stats")
+    off = res.get("offset")
+    if st is None or off is None or st.n == 0:
+        return st
+    o = float(off)
+    return pyr.Stats(st.n, o + st.min, o + st.max, o + st.mean, st.m2)
+
+
 def _csv_cell(text: str) -> str:
     if any(ch in text for ch in ',"\n\r'):
         return '"' + text.replace('"', '""') + '"'
