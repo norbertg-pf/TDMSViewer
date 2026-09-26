@@ -32,15 +32,27 @@ def _format_small_float(value: np.floating) -> str:
 
 
 def format_datetime64(value: np.datetime64) -> str:
-    """Return a timestamp as local time with UTC offset (TDMS stores UTC)."""
+    """Return a timestamp as local time with UTC offset (TDMS stores UTC).
+
+    Shows microseconds; shows nanoseconds too when they are not zero.
+    """
     if np.isnat(value):
         return "NaT"
-    us = int((value.astype("datetime64[us]") - _EPOCH).astype(np.int64))
+    rem = 0
+    if np.datetime_data(value.dtype)[0] in ("ns", "ps", "fs", "as"):
+        ns = int(value.astype("datetime64[ns]").astype(np.int64))
+        us, rem = divmod(ns, 1000)
+    else:
+        us = int((value.astype("datetime64[us]") - _EPOCH).astype(np.int64))
     try:
         utc = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc) + _dt.timedelta(microseconds=us)
-        return utc.astimezone().isoformat(sep=" ", timespec="microseconds")
+        text = utc.astimezone().isoformat(sep=" ", timespec="microseconds")
     except (OverflowError, OSError, ValueError):
         return str(value)
+    if rem:
+        head, dot, tail = text.partition(".")
+        text = f"{head}.{tail[:6]}{rem:03d}{tail[6:]}"
+    return text
 
 
 def format_value(value: object) -> str:

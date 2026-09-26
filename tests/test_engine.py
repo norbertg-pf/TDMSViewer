@@ -24,6 +24,7 @@ for _p in (str(_HERE), str(_HERE.parent)):
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 from nptdms import TdmsFile  # noqa: E402
+from tdms_builders import exact_ns  # noqa: E402
 
 from engine_helpers import (  # noqa: E402
     Driver, as_f64, assert_stats, check_envelope, nan_equal, ref_stats, same_values,
@@ -62,12 +63,12 @@ class DataFile:
 
 def _read_back(path):
     ids, data = {}, {}
-    f = TdmsFile.read(str(path))
+    f = TdmsFile.read(str(path), raw_timestamps=True)
     for g in f.groups():
         for c in g.channels():
             label = f"{g.name}/{c.name}"
             ids[label] = len(ids)
-            data[label] = np.asarray(c[:])
+            data[label] = np.asarray(exact_ns(c[:]))  # timestamps exact to 1 ns, like the viewer
     return ids, data
 
 
@@ -237,6 +238,19 @@ def brute_inner(xm, xa, xb, s, e):
     return s + int(hit[0]), s + int(hit[-1]) + 1
 
 
+def _cursor_on_channel(xm, xs, cx) -> bool:
+    """A cursor has a value only inside the channel's x range plus half a sample."""
+    if xs.size == 0:
+        return False
+    if isinstance(xm, ArrayMap) and not xm.monotonic:
+        return True
+    h0 = 0.5 * (xs[1] - xs[0]) if xs.size > 1 else 0.0
+    h1 = 0.5 * (xs[-1] - xs[-2]) if xs.size > 1 else 0.0
+    if isinstance(xm, LinearMap):
+        h0 = h1 = 0.5 * xm.dx
+    return xs[0] - h0 <= cx <= xs[-1] + h1
+
+
 def check_stats(res, samples, native, xm, xa, xb, s, e, cursors=()):
     e = min(e, samples.size)
     rng_ = brute_inner(xm, xa, xb, s, e)
@@ -252,6 +266,9 @@ def check_stats(res, samples, native, xm, xa, xb, s, e, cursors=()):
         e = min(e, xm.x.size)
     xs = sample_x(xm, np.arange(s, e))
     for cx, cur in zip(cursors, res["cursors"]):
+        if not _cursor_on_channel(xm, xs, cx):
+            assert cur is None, f"cursor {cx} is outside the channel: no value expected"
+            continue
         k = s + int(np.argmin(np.abs(xs - cx)))
         kk, xk, v = cur
         assert kk == k
@@ -298,7 +315,7 @@ def test_open_emits_model(drv, main_file):
     assert {k: c.length for k, c in by.items()} == lengths
     assert by["Wave/i32"].dtype == np.int32
     assert by["Wave/f32"].dtype == np.float32
-    assert by["Misc/stamp"].dtype == np.dtype("datetime64[us]")
+    assert by["Misc/stamp"].dtype == np.dtype("datetime64[ns]")
     assert by["Wave/sig"].type_code == 10 and by["Misc/text"].type_code == 0x20
     assert by["Wave/sig"].unit == "V" and by["Wave/offset"].unit == "A" and by["Time/Time"].unit == "s"
     sig = by["Wave/sig"]
@@ -762,11 +779,14 @@ def test_stats_other_kinds_and_maps(drv, main_file):
         cur = [T[42] + 0.2 * (T[43] - T[42]), T[42] + 0.8 * (T[43] - T[42]), -1e9, 1e9]
         out = drv.stats([PlotItem(cid, amap, 0, N)], xa, xb, cur)
         check_stats(out[cid], main_file.f64("Wave/sig"), main_file.data["Wave/sig"], amap, xa, xb, 0, N, cur)
-    # Non-monotonic ArrayMap (XY): statistics of all samples in [s, e).
+    # Non-monotonic ArrayMap (XY): statistics of the samples in [s, e) whose x is in [xa, xb].
     _, xy, _ = drv.xmap(main_file.ids["Wave/XY"])
     res = drv.stats([PlotItem(cid, xy, 10, 5000)], -0.5, 0.5)[cid]
     assert res["range"] == (10, 5000)
-    assert_stats(res["stats"], ref_stats(main_file.f64("Wave/sig")[10:5000]))
+    xs = xy.x[10:5000]
+    sel = (xs >= -0.5) & (xs <= 0.5)
+    assert 0 < sel.sum() < sel.size  # the range really selects a part
+    assert_stats(res["stats"], ref_stats(main_file.f64("Wave/sig")[10:5000][sel]))
     # Several items in one request; strings and empty channels are skipped.
     xm = LinearMap(X0, DX)
     items = [PlotItem(main_file.ids[k], xm, 0, main_file.data[k].size)
@@ -1044,11 +1064,13 @@ def test_export_x_column_next_to_nan_x(drv, xnan_file, tmp_path):
     _, amap, _ = drv.xmap(0)
     out = tmp_path / "xnan.csv"
     msg = drv.export(out, [PlotItem(1, amap, 0, X_NAN.size)], -10, 10, ["i", "x", "y"])
-    assert msg.startswith("Exported 8 rows")
+    # X-Y export: only samples whose x is inside [-10, 10] (NaN and Inf are not).
+    keep = [i for i, v in enumerate(X_NAN) if -10 <= v <= 10]
+    assert msg.startswith(f"Exported {len(keep)} rows")
     rows = _read_csv(out)[1:]
-    assert [r[0] for r in rows] == [str(i) for i in range(8)]
+    assert [r[0] for r in rows] == [str(i) for i in keep]
     got_x = [float(r[1]) for r in rows]
-    assert nan_equal(got_x, X_NAN), f"export x column {got_x} != X {X_NAN.tolist()}"
+    assert got_x == [float(X_NAN[i]) for i in keep], f"export x column {got_x}"
 
 
 def test_cursor_x_next_to_nan_x(drv, xnan_file):
@@ -1136,7 +1158,8 @@ def test_interleaved_file_chunk_pass(drv, interleaved_file):
     assert amap.monotonic
     np.testing.assert_array_equal(amap.x, time_to_seconds(f.data["IL/ts"]))
     t0 = f.data["IL/ts"][0]
-    assert t_ref == pytest.approx((t0 - np.datetime64(0, "us")) / np.timedelta64(1, "s"), abs=1e-6)
+    assert float(t_ref) == pytest.approx((t0 - np.datetime64(0, "us")) / np.timedelta64(1, "s"), abs=1e-6)
+    assert t_ref.sec * 10**9 + round(t_ref.frac * 1e9) == int(np.datetime64(t0, "ns").astype(np.int64))
 
 
 def test_interleaved_file_disk_mode(drv, interleaved_file, monkeypatch):
@@ -1178,7 +1201,7 @@ def test_layouts_and_byte_order(drv, tmp_path, interleaved, big_endian):
     assert by["f64 'q'/x"].fast and by["i16"].fast and by["u32"].fast
     assert not by["ts"].fast and not by["scaled"].fast
     np.testing.assert_array_equal(data[f"{group}/scaled"], raw * 0.5 - 3.0)
-    assert same_values(data[f"{group}/i16"], i16) and same_values(data[f"{group}/ts"], ts)
+    assert same_values(data[f"{group}/i16"], i16) and same_values(data[f"{group}/ts"], ts.astype("datetime64[ns]"))
     _check_file(drv, f)
 
 
@@ -1409,8 +1432,8 @@ def test_timestamp_channel_plotted_as_seconds(drv, main_file):
     _, amap, t_ref = drv.xmap(cid)
     assert amap.monotonic
     np.testing.assert_array_equal(amap.x, sec)
-    assert t_ref == pytest.approx(float((ts[0] - np.datetime64(0, "us")) / np.timedelta64(1, "us")) / 1e6,
-                                  abs=1e-6)
+    assert float(t_ref) == pytest.approx(float((ts[0] - np.datetime64(0, "us")) / np.timedelta64(1, "us")) / 1e6,
+                                         abs=1e-6)
     # Another channel against the timestamp channel as X.
     fid = main_file.ids["Misc/flag"]
     res = drv.plot([PlotItem(fid, amap, 0, N_FLAG)], sec[100], sec[2000], 30)[fid]

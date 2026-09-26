@@ -290,11 +290,11 @@ class Driver:
 # -- reference math --------------------------------------------------------------
 
 def time_to_seconds(a: np.ndarray) -> np.ndarray:
-    """Timestamps as float seconds after the first valid timestamp."""
-    a = a.astype("datetime64[us]")
+    """Timestamps as float seconds after the first valid timestamp (1 ns resolution)."""
+    a = a.astype("datetime64[ns]")
     ok = a[~np.isnat(a)]
-    t0 = ok[0] if ok.size else np.datetime64(0, "us")
-    return (a - t0) / np.timedelta64(1, "us") / 1e6
+    t0 = ok[0] if ok.size else np.datetime64(0, "ns")
+    return (a - t0) / np.timedelta64(1, "ns") / 1e9
 
 
 def as_f64(a: np.ndarray) -> np.ndarray:

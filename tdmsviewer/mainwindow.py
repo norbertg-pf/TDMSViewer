@@ -421,6 +421,9 @@ class MainWindow(QMainWindow):
         self._set_status("No file open.")
 
     def _clear_view(self) -> None:
+        self._copy_job = None
+        self.x_combo.clear()
+        self.x_source = (SRC_WAVE, None)
         self.model = None
         self.current = []
         self.maps = {}
@@ -606,6 +609,8 @@ class MainWindow(QMainWindow):
             tip = f"{c.label}\n{c.length} samples, {c.kind}" + (f", unit {c.unit}" if c.unit else "")
             if not c.plottable:
                 tip += "\nNot plottable (table only)"
+            elif self.x_source[0] == SRC_WAVE and not c.wf_increment:
+                tip += "\nNo wf_increment: drawn at 1 s per sample"
             elif self.maps.get(c.id) is None:
                 tip += "\nLength differs from the X channel: not plotted"
             entries.append(LegendEntry(c.id, n, c.name, theme.plot_color(n), enabled, tip))
@@ -705,7 +710,7 @@ class MainWindow(QMainWindow):
 
     def _x_source_changed(self, index: int) -> None:
         data = self.x_combo.itemData(index)
-        if not data:
+        if not data or self.model is None:
             return
         src, cid = data
         if src == SRC_CHAN:
@@ -777,8 +782,12 @@ class MainWindow(QMainWindow):
         t_ref = self._t_ref()
         if src == SRC_WAVE:
             label = "Time"
-            if self.model is not None and not any(c.wf_increment for c in self.current if c.plottable):
+            plotted = [c for c in self.current if c.plottable]
+            missing = [c for c in plotted if not c.wf_increment]
+            if missing and len(missing) == len(plotted):
                 label += " (no wf_increment: 1 sample = 1 s)"
+            elif missing:
+                label += f" ({len(missing)} channels have no wf_increment: 1 sample = 1 s for them)"
             elif fmt == FMT_NUMBER:
                 label += " [s]"
         elif src == SRC_INDEX:
@@ -790,7 +799,7 @@ class MainWindow(QMainWindow):
             import datetime as _dt
 
             try:
-                d = _dt.datetime.fromtimestamp(t_ref).astimezone()
+                d = _dt.datetime.fromtimestamp(float(t_ref)).astimezone()
                 label += f"  (local time, start {d.strftime('%Y-%m-%d %H:%M:%S %Z')})"
             except (OverflowError, OSError, ValueError):
                 pass
@@ -899,7 +908,8 @@ class MainWindow(QMainWindow):
         if missing:
             self._table_seq += 1
             self._copy_job = (self._table_seq, r0, r1, cols, blocks)
-            self.engine.request_table(TableRequest(self._table_seq, missing, start + r0, start + r1))
+            set_clipboard("")  # never paste old data if the copy cannot finish
+            self.engine.request_copy(TableRequest(self._table_seq, missing, start + r0, start + r1))
             self._set_status("Copying ...")
             return
         self._finish_copy(job, {})

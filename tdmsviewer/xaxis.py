@@ -23,6 +23,56 @@ FMT_RELATIVE = "relative"
 FMT_ABSOLUTE = "absolute"
 
 
+class TimeRef:
+    """Absolute time origin: whole Unix seconds + fraction (exact to 1 ns).
+
+    A float of Unix seconds has only ~0.2 us resolution; this keeps the
+    fraction separate so that labels stay exact at us zoom.
+    """
+
+    __slots__ = ("sec", "frac")
+
+    def __init__(self, sec: int, frac: float = 0.0):
+        w = math.floor(frac)
+        self.sec = int(sec) + int(w)
+        self.frac = float(frac - w)
+
+    @classmethod
+    def of(cls, value):
+        """TimeRef from a TimeRef, a float of Unix seconds, or None."""
+        if value is None or isinstance(value, TimeRef):
+            return value
+        f = float(value)
+        w = math.floor(f)
+        return cls(int(w), f - w)
+
+    @classmethod
+    def from_datetime64(cls, t: np.datetime64):
+        ns = int(np.datetime64(t, "ns").astype(np.int64))
+        s, r = divmod(ns, 1_000_000_000)
+        return cls(s, r / 1e9)
+
+    def __float__(self) -> float:
+        return self.sec + self.frac
+
+    def split(self, v: float) -> tuple[int, float]:
+        """(whole Unix seconds, fraction in [0, 1)) of the time t_ref + v."""
+        f = self.frac + v
+        w = math.floor(f)
+        return self.sec + int(w), f - w
+
+    def label(self, v: float, decimals: int, fmt: str = "%H:%M:%S") -> str:
+        """Local time text of t_ref + v, rounded to `decimals` digits."""
+        sec, frac = self.split(v)
+        scale = 10 ** decimals
+        units = round(frac * scale)
+        if units >= scale:  # rounding carries into the seconds
+            sec += 1
+            units -= scale
+        t = _dt.datetime.fromtimestamp(sec)
+        return t.strftime(fmt) + (f".{units:0{decimals}d}" if decimals else "")
+
+
 class LinearMap:
     """x = x0 + index * dx."""
 
@@ -73,7 +123,7 @@ class ArrayMap:
         f = np.clip(idx - i, 0.0, 1.0)
         xi = self.x[i]
         # At a whole index use X itself: 0 * (NaN or Inf neighbour) would give NaN.
-        with np.errstate(invalid="ignore"):
+        with np.errstate(invalid="ignore", over="ignore"):
             return np.where(f > 0, xi + f * (self.x[j] - xi), xi)
 
     def x_of(self, i: float) -> float:
@@ -131,12 +181,13 @@ class TimeAxisItem(pg.AxisItem):
     def __init__(self, orientation="bottom", **kw):
         super().__init__(orientation, **kw)
         self.fmt = FMT_NUMBER
-        self.t_ref = None  # Unix seconds (UTC) of x == 0, for FMT_ABSOLUTE
+        self.t_ref: TimeRef | None = None  # absolute time of x == 0, for FMT_ABSOLUTE
         self.enableAutoSIPrefix(False)
 
-    def set_format(self, fmt: str, t_ref: float | None = None) -> None:
+    def set_format(self, fmt: str, t_ref=None) -> None:
+        """t_ref: TimeRef or Unix seconds (float) of x == 0."""
         self.fmt = fmt if (fmt != FMT_ABSOLUTE or t_ref is not None) else FMT_RELATIVE
-        self.t_ref = t_ref
+        self.t_ref = TimeRef.of(t_ref)
         self.picture = None
         self.update()
 
@@ -144,7 +195,7 @@ class TimeAxisItem(pg.AxisItem):
         if self.t_ref is None:
             return 0.0
         try:
-            off = _dt.datetime.fromtimestamp(self.t_ref).astimezone().utcoffset()
+            off = _dt.datetime.fromtimestamp(self.t_ref.sec).astimezone().utcoffset()
             return off.total_seconds() if off else 0.0
         except (OverflowError, OSError, ValueError):
             return 0.0
@@ -158,7 +209,11 @@ class TimeAxisItem(pg.AxisItem):
         per_label = 115.0 if self.orientation in ("bottom", "top") else 30.0
         want = span / max(2.0, size / per_label)
         if want < 1.0:
-            return super().tickSpacing(minVal, maxVal, size)
+            levels = super().tickSpacing(minVal, maxVal, size)
+            if self.fmt == FMT_ABSOLUTE and self.t_ref is not None:
+                # Put sub-second ticks on round absolute times, not on t_ref + k * spacing.
+                levels = [(sp, (-self.t_ref.frac) % sp) for sp, _off in levels]
+            return levels
         major = next((s for s in _TIME_STEPS if s >= want), None)
         if major is None:
             days = 86400.0 * 10 ** math.ceil(math.log10(want / 86400.0))
@@ -166,7 +221,7 @@ class TimeAxisItem(pg.AxisItem):
         minor = _MINOR.get(major, major / 4)
         off = 0.0
         if self.fmt == FMT_ABSOLUTE:
-            off = (-(self.t_ref + self._utc_offset())) % major
+            off = (-((self.t_ref.sec % major) + self.t_ref.frac + self._utc_offset())) % major
         return [(float(major), off), (float(minor), off % minor if minor else 0)]
 
     def tickValues(self, minVal, maxVal, size):
@@ -191,11 +246,12 @@ class TimeAxisItem(pg.AxisItem):
 
     def _calendar_ticks(self, minVal: float, maxVal: float, spacing: float) -> list[float]:
         """Ticks on local wall-clock hours/days (correct across daylight saving changes)."""
+        t0 = float(self.t_ref)
         try:
-            first = _dt.datetime.fromtimestamp(self.t_ref + minVal)
+            first = _dt.datetime.fromtimestamp(t0 + minVal)
         except (OverflowError, OSError, ValueError):
             return []
-        end = self.t_ref + maxVal
+        end = t0 + maxVal
         if spacing >= 86400:
             days = int(spacing // 86400)
             d = first.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -213,8 +269,8 @@ class TimeAxisItem(pg.AxisItem):
                 break
             if ts > end:
                 break
-            if ts >= self.t_ref + minVal:
-                vals.append(ts - self.t_ref)
+            if ts >= t0 + minVal:
+                vals.append((ts - self.t_ref.sec) - self.t_ref.frac)
             d += step
         return vals
 
@@ -225,19 +281,12 @@ class TimeAxisItem(pg.AxisItem):
         if self.fmt == FMT_RELATIVE:
             return [format_duration(v, dec) for v in values]
         out = []
-        scale = 10 ** dec
         for v in values:
             try:
-                # Round once in integer units so that x.9996 s carries into the seconds.
-                secs, frac = divmod(round((self.t_ref + v) * scale), scale)
-                t = _dt.datetime.fromtimestamp(secs)
+                if spacing >= 86400:
+                    out.append(self.t_ref.label(v, 0, "%Y-%m-%d"))
+                else:
+                    out.append(self.t_ref.label(v, dec))  # rounding carries into the seconds
             except (OverflowError, OSError, ValueError):
                 out.append("")
-                continue
-            if spacing >= 86400:
-                out.append(t.strftime("%Y-%m-%d"))
-            elif spacing >= 1:
-                out.append(t.strftime("%H:%M:%S"))
-            else:
-                out.append(t.strftime("%H:%M:%S") + (f".{frac:0{dec}d}" if dec else ""))
         return out

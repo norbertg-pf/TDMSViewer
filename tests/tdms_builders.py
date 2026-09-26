@@ -614,17 +614,98 @@ def assert_same_values(got, ref, msg: str = "") -> None:
         raise AssertionError(f"{msg}: bytes differ at {diff} got={got_a[diff]} ref={ref_a[diff]}")
 
 
+def exact_ns(v):
+    """Reference: npTDMS raw timestamp(s) -> datetime64[ns], nearest ns, Python ints.
+
+    Independent of tdmsviewer.tdmsfile.tdms_time_to_ns. Other values unchanged.
+    """
+    from nptdms.timestamp import TdmsTimestamp
+
+    def one(sec, frac):
+        return (int(sec) - 2_082_844_800) * 10**9 + (int(frac) * 10**9 + 2**63) // 2**64
+
+    if isinstance(v, TdmsTimestamp):
+        return np.datetime64(one(v.seconds, v.second_fractions), "ns")
+    if isinstance(v, np.ndarray) and v.dtype.names and "second_fractions" in v.dtype.names:
+        ns = [one(s_, f_) for s_, f_ in zip(v["seconds"].tolist(), v["second_fractions"].tolist())]
+        return np.array(ns, dtype=np.int64).astype("datetime64[ns]")
+    return v
+
+
+class _RefChannel:
+    """npTDMS channel read with raw timestamps; values/properties with exact ns times."""
+
+    def __init__(self, ch):
+        self._ch = ch
+
+    def __getitem__(self, idx):
+        return exact_ns(self._ch[idx])
+
+    def __len__(self):
+        return len(self._ch)
+
+    @property
+    def properties(self):
+        return {k: exact_ns(v) for k, v in self._ch.properties.items()}
+
+    @property
+    def dtype(self):
+        d = self._ch.dtype
+        return np.dtype("datetime64[ns]") if d.kind == "M" else d
+
+    def __getattr__(self, name):
+        return getattr(self._ch, name)
+
+
+class _RefGroup:
+    def __init__(self, g):
+        self._g = g
+
+    def __getitem__(self, name):
+        return _RefChannel(self._g[name])
+
+    def channels(self):
+        return [_RefChannel(c) for c in self._g.channels()]
+
+    @property
+    def properties(self):
+        return {k: exact_ns(v) for k, v in self._g.properties.items()}
+
+    def __getattr__(self, name):
+        return getattr(self._g, name)
+
+
+class RefFile:
+    """TdmsFile wrapper: timestamps as exact datetime64[ns] (like the viewer shows)."""
+
+    def __init__(self, f):
+        self._f = f
+
+    def __getitem__(self, name):
+        return _RefGroup(self._f[name])
+
+    def groups(self):
+        return [_RefGroup(g) for g in self._f.groups()]
+
+    @property
+    def properties(self):
+        return {k: exact_ns(v) for k, v in self._f.properties.items()}
+
+    def __getattr__(self, name):
+        return getattr(self._f, name)
+
+
 def nptdms_full(path, use_index: bool = True):
-    """TdmsFile.read of a file (all data in memory).
+    """TdmsFile.read of a file (all data in memory), timestamps exact to 1 ns.
 
     use_index=False reads the data file alone (ignores .tdms_index).
     """
     from nptdms import TdmsFile
 
     if use_index:
-        return TdmsFile.read(os.fspath(path))
+        return RefFile(TdmsFile.read(os.fspath(path), raw_timestamps=True))
     with open(os.fspath(path), "rb") as fh:
-        return TdmsFile.read(fh)
+        return RefFile(TdmsFile.read(fh, raw_timestamps=True))
 
 
 def nptdms_channel_data(tdms, group: str, name: str):

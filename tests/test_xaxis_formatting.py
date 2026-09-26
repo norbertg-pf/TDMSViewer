@@ -185,7 +185,7 @@ def test_axis_formats(axis):
     axis.set_format(FMT_ABSOLUTE, None)
     assert axis.fmt == FMT_RELATIVE
     axis.set_format(FMT_ABSOLUTE, 1.7e9)
-    assert axis.fmt == FMT_ABSOLUTE and axis.t_ref == 1.7e9
+    assert axis.fmt == FMT_ABSOLUTE and float(axis.t_ref) == 1.7e9  # exact TimeRef
     axis.set_format(FMT_NUMBER)
     assert axis.fmt == FMT_NUMBER
 
@@ -386,7 +386,9 @@ def test_format_datetime64_local_with_offset(set_tz):
 def test_format_datetime64_units_and_edges(set_tz):
     set_tz("UTC")
     assert format_datetime64(np.datetime64("NaT")) == "NaT"
-    assert format_datetime64(np.datetime64("2024-01-02T03:04:05.123456789", "ns")) == "2024-01-02 03:04:05.123456+00:00"
+    # ns values keep their ns digits (TDMS timestamps have 2**-64 s resolution).
+    assert format_datetime64(np.datetime64("2024-01-02T03:04:05.123456789", "ns")) == "2024-01-02 03:04:05.123456789+00:00"
+    assert format_datetime64(np.datetime64("2024-01-02T03:04:05.123456000", "ns")) == "2024-01-02 03:04:05.123456+00:00"
     assert format_datetime64(np.datetime64("2024-01-02", "D")) == "2024-01-02 00:00:00.000000+00:00"
     assert format_datetime64(np.datetime64("1904-01-01T00:00:00", "us")) == "1904-01-01 00:00:00.000000+00:00"
     assert format_datetime64(np.datetime64("1969-12-31T23:59:59.5", "us")) == "1969-12-31 23:59:59.500000+00:00"

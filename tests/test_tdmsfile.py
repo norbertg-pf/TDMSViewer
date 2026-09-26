@@ -145,7 +145,7 @@ def test_kinds_and_type_codes(scenario, open_source):
     assert by_name["t_c16"].kind == KIND_COMPLEX and by_name["t_c16"].plottable
     assert by_name["text"].kind == KIND_STRING and not by_name["text"].plottable
     assert by_name["time"].kind == KIND_TIME and by_name["time"].plottable
-    assert by_name["time"].dtype == np.dtype("datetime64[us]")
+    assert by_name["time"].dtype == np.dtype("datetime64[ns]")  # exact from raw timestamps
     assert by_name["empty_i32"].kind == KIND_EMPTY and by_name["empty_i32"].length == 0
     assert by_name["no_data"].kind == KIND_EMPTY and by_name["no_data"].type_code is None
     assert by_name["no_data"].properties == {"note": "never has data"}
@@ -163,14 +163,17 @@ def test_waveform_properties_and_time_reference(scenario, open_source):
     by_name = {c.name: c for c in m.channels}
     sine, later, rel = by_name["sine"], by_name["later"], by_name["relative"]
     assert sine.wf_increment == 0.001 and sine.wf_start_offset == 0.5
-    assert sine.wf_start_time == np.datetime64("2026-07-28T12:05:36.250000", "us")
-    assert later.wf_start_time == np.datetime64("2026-07-28T12:05:40", "us")
+    # The builder writes each time at the middle of its microsecond (+0.5 us);
+    # the viewer shows the exact stored value (npTDMS would truncate it).
+    assert sine.wf_start_time == np.datetime64("2026-07-28T12:05:36.250000500", "ns")
+    assert later.wf_start_time == np.datetime64("2026-07-28T12:05:40.000000500", "ns")
     assert rel.wf_start_time is None  # TDMS epoch means relative time
     assert rel.wf_start_offset == 1.5 and rel.wf_increment == 0.01
     assert sine.unit == "V" and later.unit == "A" and rel.unit == ""
     assert m.t_ref == sine.wf_start_time
     exp_unix = (np.datetime64("2026-07-28T12:05:36.250000", "us") - np.datetime64(0, "us")) / np.timedelta64(1, "s")
-    assert m.t_ref_unix == pytest.approx(float(exp_unix), abs=1e-6)
+    assert float(m.t_ref_unix) == pytest.approx(float(exp_unix), abs=1e-6)
+    assert (m.t_ref_unix.sec, round(m.t_ref_unix.frac * 1e9)) == (int(exp_unix), 250_000_500)
     assert m.start_seconds(sine) == pytest.approx(0.5, abs=1e-12)
     assert m.start_seconds(later) == pytest.approx(3.75, abs=1e-12)
     assert m.start_seconds(rel) == 1.5

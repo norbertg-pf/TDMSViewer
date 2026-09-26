@@ -19,15 +19,44 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from nptdms import TdmsFile
+from nptdms.timestamp import TdmsTimestamp
 
 from . import fastread
 from .fastread import nptdms_read
+from .xaxis import TimeRef
 
 _log = logging.getLogger(__name__)
 
 # The TDMS epoch (1904-01-01) as wf_start_time means "relative time".
-_TDMS_EPOCH = np.datetime64("1904-01-01T00:00:00", "us")
-_UNIX_EPOCH = np.datetime64(0, "us")
+_TDMS_EPOCH = np.datetime64("1904-01-01T00:00:00", "ns")
+_EPOCH_OFFSET_S = 2_082_844_800  # seconds from 1904-01-01 to 1970-01-01 (UTC)
+
+
+def tdms_time_to_ns(seconds, fractions):
+    """TDMS timestamps (seconds since 1904, 2**-64 s fractions) -> datetime64[ns].
+
+    Exact integer arithmetic, rounded to the nearest ns (npTDMS itself
+    truncates to 1 us). ns = round(fractions * 1e9 / 2**64).
+    """
+    sec = np.asarray(seconds, dtype=np.int64)
+    fr = np.asarray(fractions, dtype=np.uint64)
+    g = np.uint64(1_000_000_000)
+    s32 = np.uint64(32)
+    total = (fr >> s32) * g + (((fr & np.uint64(0xFFFFFFFF)) * g) >> s32)  # floor(fr * 1e9 / 2**32)
+    ns = ((total + np.uint64(1 << 31)) >> s32).astype(np.int64)  # round(total / 2**32)
+    return ((sec - _EPOCH_OFFSET_S) * 1_000_000_000 + ns).astype("datetime64[ns]")
+
+
+def _to_datetime64(v):
+    """npTDMS raw timestamp (scalar or TimestampArray) -> datetime64[ns]; other values unchanged."""
+    if isinstance(v, TdmsTimestamp):
+        try:
+            return tdms_time_to_ns(v.seconds, v.second_fractions)[()]
+        except (OverflowError, ValueError):
+            return v.as_datetime64("us")
+    if isinstance(v, np.ndarray) and v.dtype.names and "second_fractions" in v.dtype.names:
+        return tdms_time_to_ns(v["seconds"], v["second_fractions"])
+    return v
 
 
 # -- npTDMS log capture ------------------------------------------------------
@@ -129,17 +158,17 @@ class FileModel:
         return os.path.basename(self.path)
 
     @property
-    def t_ref_unix(self) -> float | None:
-        """t_ref as Unix seconds (float), or None."""
+    def t_ref_unix(self):
+        """t_ref as an exact TimeRef (Unix seconds + fraction), or None."""
         if self.t_ref is None:
             return None
-        return float((self.t_ref - _UNIX_EPOCH) / np.timedelta64(1, "us")) / 1e6
+        return TimeRef.from_datetime64(self.t_ref)
 
     def start_seconds(self, ch: ChannelInfo) -> float:
-        """Channel start time relative to t_ref, in seconds (0 if unknown)."""
+        """Channel start time relative to t_ref, in seconds (0 if unknown), 1 ns resolution."""
         off = ch.wf_start_offset or 0.0
         if ch.wf_start_time is not None and self.t_ref is not None:
-            off += float((ch.wf_start_time - self.t_ref) / np.timedelta64(1, "us")) / 1e6
+            off += int((ch.wf_start_time - self.t_ref) / np.timedelta64(1, "ns")) / 1e9
         return off
 
 
@@ -160,6 +189,11 @@ def _kind(dtype: np.dtype, length: int) -> str:
     return KIND_EMPTY
 
 
+def _props(props) -> dict:
+    """Properties with raw timestamps converted to datetime64[ns]."""
+    return {k: _to_datetime64(v) for k, v in props.items()}
+
+
 def _float_prop(props: dict, key: str) -> float | None:
     v = props.get(key)
     if v is None:
@@ -174,7 +208,7 @@ def _float_prop(props: dict, key: str) -> float | None:
 def _time_prop(props: dict, key: str) -> np.datetime64 | None:
     v = props.get(key)
     if isinstance(v, np.datetime64):
-        v = v.astype("datetime64[us]")
+        v = v.astype("datetime64[ns]")
         if np.isnat(v) or v == _TDMS_EPOCH:
             return None
         return v
@@ -195,7 +229,7 @@ class TdmsSource:
         size = os.path.getsize(self.path)
         has_index = os.path.isfile(self.path + "_index")
         try:
-            self._file = TdmsFile.open(self.path)
+            self._file = TdmsFile.open(self.path, raw_timestamps=True)
         except Exception as exc:
             if not has_index:
                 raise
@@ -231,7 +265,7 @@ class TdmsSource:
 
     def _open_without_index(self) -> None:
         self._fh = open(self.path, "rb")  # a file object makes npTDMS skip the index
-        self._file = TdmsFile.open(self._fh)
+        self._file = TdmsFile.open(self._fh, raw_timestamps=True)
 
     def _index_matches(self, size: int, samples: int = 256) -> bool:
         """True if the index segments agree with the data file lead-ins.
@@ -275,14 +309,16 @@ class TdmsSource:
         channels: list[ChannelInfo] = []
         starts = []
         for g in self._file.groups():
-            ginfo = GroupInfo(g.name, dict(g.properties), [])
+            ginfo = GroupInfo(g.name, _props(g.properties), [])
             for c in g.channels():
-                props = dict(c.properties)
+                props = _props(c.properties)
                 length = len(c)
                 try:
                     dtype = np.dtype(c.dtype)
                 except Exception:
                     dtype = np.dtype("V8")
+                if dtype.kind == "M":
+                    dtype = np.dtype("datetime64[ns]")  # converted exactly from raw timestamps
                 dt = c.data_type
                 code = getattr(dt, "enum_value", None) if dt is not None else None
                 unit = props.get("unit_string") or props.get("Unit") or props.get("unit") or ""
@@ -314,7 +350,7 @@ class TdmsSource:
         except Exception:
             nseg = 0
         return FileModel(
-            path=self.path, size=size, properties=dict(self._file.properties), groups=groups,
+            path=self.path, size=size, properties=_props(self._file.properties), groups=groups,
             channels=channels, t_ref=min(starts) if starts else None, n_segments=nseg,
             index_used=index_used,
         )
@@ -337,7 +373,16 @@ class TdmsSource:
         fast = self._fast[cid]
         if fast is not None:
             return fast.read(start, stop)
-        a = np.asarray(nptdms_read(self._channels[cid], start, stop - start))
+        # npTDMS seeks the shared file handle. Restore the position, so that a
+        # data_chunks() pass that runs between requests reads on correctly.
+        fh = getattr(self._file._reader, "_file", None)
+        pos = fh.tell() if fh is not None else None
+        try:
+            a = _to_datetime64(nptdms_read(self._channels[cid], start, stop - start))
+            a = np.asarray(a)
+        finally:
+            if pos is not None:
+                fh.seek(pos)
         if not a.dtype.isnative:
             a = a.astype(a.dtype.newbyteorder("="))
         return a
@@ -361,7 +406,7 @@ class TdmsSource:
                 for cc in g.channels():
                     cid = by_key.get((g.name, cc.name))
                     if cid is not None and len(cc):
-                        a = np.asarray(cc[:])
+                        a = np.asarray(_to_datetime64(cc[:]))
                         if not a.dtype.isnative:
                             a = a.astype(a.dtype.newbyteorder("="))
                         yield cid, cc.offset, a

@@ -30,7 +30,7 @@ from PySide6.QtCore import QObject, Signal
 
 from . import pyramid as pyr
 from .tdmsfile import KIND_BOOL, KIND_COMPLEX, KIND_TIME, PLOTTABLE, ChannelInfo, TdmsSource
-from .xaxis import ArrayMap, LinearMap
+from .xaxis import ArrayMap, LinearMap, TimeRef, is_monotonic
 
 BLOCK = 1 << 22  # samples per load step
 PYR_BASE_RAM = 256
@@ -168,7 +168,7 @@ class _Progress:
 def _first_time(a: np.ndarray):
     """First valid timestamp of an array (the zero of time-channel plots)."""
     ok = a[~np.isnat(a)] if a.size else a
-    return ok[0].astype("datetime64[us]") if ok.size else np.datetime64(0, "us")
+    return ok[0].astype("datetime64[ns]") if ok.size else np.datetime64(0, "ns")
 
 
 def to_f64(a: np.ndarray, kind: str, t0=None) -> np.ndarray:
@@ -177,8 +177,8 @@ def to_f64(a: np.ndarray, kind: str, t0=None) -> np.ndarray:
         return a
     if kind == KIND_TIME:
         if t0 is None:
-            t0 = np.datetime64(0, "us")
-        return (a.astype("datetime64[us]") - t0) / np.timedelta64(1, "us") / 1e6
+            t0 = np.datetime64(0, "ns")
+        return (a.astype("datetime64[ns]") - t0) / np.timedelta64(1, "ns") / 1e9
     if kind == KIND_COMPLEX:
         return np.abs(a).astype(np.float64)
     if kind == KIND_BOOL:
@@ -200,7 +200,7 @@ class DataEngine(QObject):
     exportDone = Signal(int, int, str)  # gen, seq, message
     message = Signal(int, str)  # gen, warning text
 
-    _ORDER = ("open", "close", "xarr", "plot", "table", "stats", "export")
+    _ORDER = ("open", "close", "xarr", "plot", "copy", "table", "stats", "export")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -214,6 +214,8 @@ class DataEngine(QObject):
         self._stores: list[_Store] = []
         self._stores_gen = -1
         self._bg = None
+        self._tasks: list = []  # user tasks (generators): export, X values
+        self._builds: list = []  # helper-thread futures of the current file
         self._priority: list[int] = []
         self._pool = futures.ThreadPoolExecutor(max_workers=max(1, min(4, (os.cpu_count() or 2) - 2)),
                                                 thread_name_prefix="tdms-pyramid")
@@ -252,6 +254,10 @@ class DataEngine(QObject):
 
     def request_table(self, req: TableRequest) -> None:
         self._post("table", (self._gen, req))
+
+    def request_copy(self, req: TableRequest) -> None:
+        """Like request_table, in its own slot: table scrolling cannot drop it."""
+        self._post("copy", (self._gen, req))
 
     def request_stats(self, req: StatsRequest) -> None:
         self._post("stats", (self._gen, req))
@@ -295,7 +301,7 @@ class DataEngine(QObject):
         while True:
             job = None
             with self._cv:
-                while not self._slots and self._bg is None and not self._quit:
+                while not self._slots and self._bg is None and not self._tasks and not self._quit:
                     self._cv.wait()
                 if self._quit:
                     break
@@ -303,22 +309,37 @@ class DataEngine(QObject):
                     if kind in self._slots:
                         job = (kind, self._slots.pop(kind))
                         break
+            task = None
             try:
                 if job is not None:
                     self._handle(*job)
+                elif self._tasks:
+                    # User tasks (export, X values) before the background load.
+                    task = self._tasks.pop(0)
+                    try:
+                        next(task)
+                        self._tasks.append(task)
+                    except StopIteration:
+                        pass
                 elif self._bg is not None:
                     try:
                         next(self._bg)
                     except StopIteration:
                         self._bg = None
             except Exception as exc:  # never let the worker die
-                self._bg = None if job is None else self._bg
+                if job is None and task is None:
+                    self._bg = None
                 traceback.print_exc()
                 self.message.emit(self._stores_gen, f"Internal error: {exc}")
         self._close_source()
 
     def _pending(self, kind: str) -> bool:
         return kind in self._slots or "open" in self._slots or "close" in self._slots
+
+    def _cancelled(self, gen: int) -> bool:
+        """True if a user task of file `gen` must stop (new file, close, quit)."""
+        return (gen != self._gen or gen != self._stores_gen or self._quit
+                or "open" in self._slots or "close" in self._slots)
 
     def _handle(self, kind: str, payload) -> None:
         if kind == "open":
@@ -335,18 +356,27 @@ class DataEngine(QObject):
         if kind == "plot":
             self._do_plot(gen, req)
         elif kind == "table":
-            self._do_table(gen, req)
+            self._do_table(gen, req, "table")
+        elif kind == "copy":
+            self._do_table(gen, req, "copy")
         elif kind == "stats":
             self._do_stats(gen, req)
         elif kind == "xarr":
-            self._do_x(gen, req)
+            self._tasks.append(self._x_task(gen, req))
         elif kind == "export":
-            self._do_export(gen, req)
+            self._tasks.append(self._export_task(gen, req))
 
     # -- open / load ----------------------------------------------------------------
 
     def _close_source(self) -> None:
         self._bg = None
+        for task in self._tasks:
+            task.close()  # runs the task's cleanup (for example: delete .part file)
+        self._tasks = []
+        # Helper threads stop at their next block; wait so no fd is used after close.
+        if self._builds:
+            futures.wait(self._builds, timeout=10.0)
+            self._builds = []
         with self._sync_lock:
             src, self._source = self._source, None
             self._stores = []
@@ -404,7 +434,7 @@ class DataEngine(QObject):
         # npTDMS channels of an interleaved/DAQmx file: one data_chunks() pass.
         chunk_pass = [s for s in stores if mixed and s.fast is None and s.info.length]
         chunk_ids = {s.info.id for s in chunk_pass}
-        builds: list = []
+        builds = self._builds
         remaining = dict.fromkeys(s.info.id for s in stores if s.info.id not in chunk_ids)
         while remaining:
             pick = next((c for c in self._priority if c in remaining), None)
@@ -433,11 +463,11 @@ class DataEngine(QObject):
         while builds:
             if gen != self._stores_gen:
                 return
-            finished, rest = futures.wait(builds, timeout=0.02)
+            finished, _rest = futures.wait(builds, timeout=0.02)
             for f in finished:
+                builds.remove(f)
                 if f.exception() is not None:
                     self.message.emit(gen, f"Overview build failed: {f.exception()}")
-            builds = list(rest)
             prog.step("Building overview")
             yield
         for w in src.drain_warnings():
@@ -532,7 +562,7 @@ class DataEngine(QObject):
         p = st.pyr
         info = st.info
         for i in range(0, arr.size, BLOCK):
-            if gen != self._stores_gen:
+            if gen != self._stores_gen or gen != self._gen:
                 return
             p.append(to_f64(arr[i:i + BLOCK], info.kind, st.t0))
         st.done = True
@@ -546,7 +576,7 @@ class DataEngine(QObject):
         n = info.length
         buf = np.empty(min(n, BLOCK), dtype=st.fast.dtype)
         for i in range(0, n, BLOCK):
-            if gen != self._stores_gen:
+            if gen != self._stores_gen or gen != self._gen:
                 return
             blk = buf[: min(BLOCK, n - i)]
             st.fast.read_into(blk, i)
@@ -670,10 +700,10 @@ class DataEngine(QObject):
 
     # -- table ----------------------------------------------------------------------
 
-    def _do_table(self, gen: int, req: TableRequest) -> None:
+    def _do_table(self, gen: int, req: TableRequest, kind: str = "table") -> None:
         out = {}
         for cid in req.cids:
-            if self._pending("table"):
+            if self._pending(kind):
                 return
             if not (0 <= cid < len(self._stores)):
                 continue
@@ -709,21 +739,32 @@ class DataEngine(QObject):
         xmap = it.xmap
         if isinstance(xmap, ArrayMap):
             e = min(e, xmap.x.size)
-        i0, i1 = inner_range(xmap, req.xa, req.xb, s, e)
-        res = {"range": (i0, i1), "stats": None, "cursors": []}
-        n = i1 - i0
-        if n > 0:
-            p = st.pyr
-            if p is not None and p.covered >= i1:
-                res["stats"] = p.stats(i0, i1, lambda a, z: self._read_f64(st, a, z))
-            elif self._can_read_cheap(st, n):
-                res["stats"] = pyr.raw_stats(self._read_f64(st, i0, i1))
+        res = {"range": (s, s), "stats": None, "cursors": []}
+        if isinstance(xmap, ArrayMap) and not xmap.monotonic:
+            # X-Y plot: the samples whose x is inside [xa, xb], in any order.
+            res["range"] = (s, e)
+            if e <= s:
+                res["stats"] = pyr.EMPTY
+            elif self._can_read_cheap(st, e - s):
+                xs = xmap.x[s:e]
+                sel = (xs >= req.xa) & (xs <= req.xb)
+                res["stats"] = pyr.raw_stats(self._read_f64(st, s, e)[sel])
         else:
-            res["stats"] = pyr.EMPTY
+            i0, i1 = inner_range(xmap, req.xa, req.xb, s, e)
+            res["range"] = (i0, i1)
+            n = i1 - i0
+            if n <= 0:
+                res["stats"] = pyr.EMPTY
+            else:
+                p = st.pyr
+                if p is not None and p.covered >= i1:
+                    res["stats"] = p.stats(i0, i1, lambda a, z: self._read_f64(st, a, z))
+                elif self._can_read_cheap(st, n):
+                    res["stats"] = pyr.raw_stats(self._read_f64(st, i0, i1))
         for cx in req.cursors:
             k = xmap.nearest(cx, s, e)
-            if k < 0:
-                res["cursors"].append(None)
+            if k < 0 or not covers(xmap, cx, s, e):
+                res["cursors"].append(None)  # no sample of this channel at the cursor
             else:
                 v = self._read(st, k, k + 1)
                 res["cursors"].append((k, float(xmap.x_of(k)), v[0] if v.size else None))
@@ -731,11 +772,12 @@ class DataEngine(QObject):
 
     # -- x channel ------------------------------------------------------------------
 
-    def _do_x(self, gen: int, req: XRequest) -> None:
-        if not (0 <= req.cid < len(self._stores)):
+    def _x_task(self, gen: int, req: XRequest):
+        """Load a channel as X values (task: one block per step, cancellable)."""
+        st = self._store(req.cid)
+        if st is None:
             self.xReady.emit(gen, req.seq, "Unknown channel")
             return
-        st = self._stores[req.cid]
         info = st.info
         if not info.plottable:
             self.xReady.emit(gen, req.seq, f"{info.label} is not numeric")
@@ -743,24 +785,37 @@ class DataEngine(QObject):
         if info.length * 8 > ram_budget_bytes():
             self.xReady.emit(gen, req.seq, f"{info.label} is too large to use as X axis")
             return
-        x = self._read_f64(st, 0, info.length)
-        if x.dtype != np.float64 or not x.flags.c_contiguous:
-            x = np.ascontiguousarray(x, dtype=np.float64)
-        from .xaxis import is_monotonic
-
+        x = np.empty(info.length)
+        for i in range(0, info.length, BLOCK):
+            if self._cancelled(gen):
+                return
+            j = min(info.length, i + BLOCK)
+            x[i:j] = self._read_f64(st, i, j)
+            if info.length > BLOCK:
+                self.progress.emit(gen, min(0.999, j / info.length), f"Loading X values of {info.label}")
+                yield
         mono = is_monotonic(x)
         t_ref = None
         if info.kind == KIND_TIME and st.t0 is not None:
-            t_ref = float((st.t0 - np.datetime64(0, "us")) / np.timedelta64(1, "us")) / 1e6
+            t_ref = TimeRef.from_datetime64(st.t0)
+        if info.length > BLOCK:
+            self.progress.emit(gen, 1.0, f"X values of {info.label} loaded")
         self.xReady.emit(gen, req.seq, (req.cid, ArrayMap(x, mono), t_ref))
 
     # -- export ---------------------------------------------------------------------
 
-    def _do_export(self, gen: int, req: ExportRequest) -> None:
+    def _export_task(self, gen: int, req: ExportRequest):
+        """Write the samples inside [xa, xb] as CSV (task, cancellable).
+
+        The file is written as <path>.part and renamed only when complete,
+        so a cancelled or failed export never leaves a file that looks complete.
+        """
         from .formatting import format_export
 
+        part = req.path + ".part"
+        done = False
         try:
-            ranges = []
+            cols = []
             for it in req.items:
                 st = self._store(it.cid)
                 if st is None:
@@ -768,37 +823,59 @@ class DataEngine(QObject):
                 e = min(it.e, st.info.length)
                 if isinstance(it.xmap, ArrayMap):
                     e = min(e, it.xmap.x.size)
-                ranges.append((st, it, *inner_range(it.xmap, req.xa, req.xb, it.s, e)))
-            rows = max((i1 - i0 for _, _, i0, i1 in ranges), default=0)
-            with open(req.path, "w", encoding="utf-8", newline="") as fh:
+                if isinstance(it.xmap, ArrayMap) and not it.xmap.monotonic:
+                    xs = it.xmap.x[it.s:e]
+                    idx = it.s + np.flatnonzero((xs >= req.xa) & (xs <= req.xb))
+                    cols.append((st, it, idx, idx.size))
+                else:
+                    i0, i1 = inner_range(it.xmap, req.xa, req.xb, it.s, e)
+                    cols.append((st, it, (i0, i1), max(0, i1 - i0)))
+            rows = max((c[3] for c in cols), default=0)
+            step = 1 << 16
+            with open(part, "w", encoding="utf-8", newline="") as fh:
                 fh.write(",".join(_csv_cell(h) for h in req.header) + "\n")
-                step = 1 << 16
                 for r0 in range(0, rows, step):
-                    if gen != self._stores_gen:
+                    if self._cancelled(gen):
+                        self.exportDone.emit(gen, req.seq, "Export cancelled. No file was written.")
                         return
                     r1 = min(rows, r0 + step)
-                    cols = []
-                    for st, it, i0, i1 in ranges:
-                        a0, a1 = i0 + r0, min(i1, i0 + r1)
-                        idx = np.arange(a0, max(a0, a1))
-                        xs = it.xmap.index_to_x(idx) if idx.size else np.empty(0)
-                        vals = self._read(st, a0, a1) if a1 > a0 else np.empty(0)
-                        cols.append((idx, xs, vals))
+                    blocks = []
+                    for st, it, sel, count in cols:
+                        a1 = min(r1, count)
+                        if a1 <= r0:
+                            blocks.append(None)
+                            continue
+                        if isinstance(sel, tuple):
+                            idx = np.arange(sel[0] + r0, sel[0] + a1)
+                        else:
+                            idx = sel[r0:a1]
+                        raw = self._read(st, int(idx[0]), int(idx[-1]) + 1)
+                        blocks.append((idx, it.xmap.index_to_x(idx), raw[idx - idx[0]]))
                     lines = []
                     for k in range(r1 - r0):
                         cells = []
-                        for idx, xs, vals in cols:
-                            if k < idx.size:
-                                cells += [str(int(idx[k])), repr(float(xs[k])), _csv_cell(format_export(vals[k]))]
+                        for blk in blocks:
+                            if blk is not None and k < blk[0].size:
+                                cells += [str(int(blk[0][k])), repr(float(blk[1][k])),
+                                          _csv_cell(format_export(blk[2][k]))]
                             else:
                                 cells += ["", "", ""]
                         lines.append(",".join(cells))
                     fh.write("\n".join(lines) + "\n")
                     self.progress.emit(gen, min(0.999, r1 / max(1, rows)), "Exporting CSV")
+                    yield
+            os.replace(part, req.path)
+            done = True
             self.progress.emit(gen, 1.0, f"Exported {rows} rows")
             self.exportDone.emit(gen, req.seq, f"Exported {rows} rows to {req.path}")
         except Exception as exc:
-            self.exportDone.emit(gen, req.seq, f"Export failed: {exc}")
+            self.exportDone.emit(gen, req.seq, f"Export failed: {exc}. No file was written.")
+        finally:
+            if not done:
+                try:
+                    os.remove(part)
+                except OSError:
+                    pass
 
 
 def _csv_cell(text: str) -> str:
@@ -825,3 +902,19 @@ def inner_range(xmap, xa: float, xb: float, s: int, e: int) -> tuple[int, int]:
     i0 = s + int(np.searchsorted(seg, xa, side="left"))
     i1 = s + int(np.searchsorted(seg, xb, side="right"))
     return i0, max(i0, i1)
+
+
+def covers(xmap, x: float, s: int, e: int) -> bool:
+    """True if x is inside the channel's samples [s, e) plus half a sample."""
+    if e <= s:
+        return False
+    if isinstance(xmap, LinearMap):
+        lo, hi = xmap.x_of(s), xmap.x_of(e - 1)
+        half = 0.5 * xmap.dx
+        return lo - half <= x <= hi + half
+    if not xmap.monotonic:
+        return True
+    lo, hi = float(xmap.x[s]), float(xmap.x[e - 1])
+    half0 = 0.5 * float(xmap.x[s + 1] - xmap.x[s]) if e - s > 1 else 0.0
+    half1 = 0.5 * float(xmap.x[e - 1] - xmap.x[e - 2]) if e - s > 1 else 0.0
+    return lo - half0 <= x <= hi + half1

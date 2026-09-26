@@ -15,7 +15,6 @@ Mouse
 
 from __future__ import annotations
 
-import datetime as _dt
 import math
 import time
 from dataclasses import dataclass
@@ -31,7 +30,7 @@ from PySide6.QtWidgets import (
 
 from . import theme
 from .formatting import format_duration, format_si
-from .xaxis import FMT_ABSOLUTE, FMT_NUMBER, FMT_RELATIVE, TimeAxisItem
+from .xaxis import FMT_ABSOLUTE, FMT_NUMBER, FMT_RELATIVE, TimeAxisItem, TimeRef
 
 TOOL_ZOOM, TOOL_ZOOMX, TOOL_ZOOMY, TOOL_PAN = "zoom", "zoomx", "zoomy", "pan"
 _ZOOM_TOOLS = (TOOL_ZOOM, TOOL_ZOOMX, TOOL_ZOOMY)
@@ -416,9 +415,10 @@ class PlotPanel(QWidget):
 
     # -- axes -------------------------------------------------------------------------
 
-    def set_x_axis(self, fmt: str, t_ref: float | None, label: str) -> None:
+    def set_x_axis(self, fmt: str, t_ref, label: str) -> None:
+        """t_ref: TimeRef (or Unix seconds) of x == 0 for absolute labels."""
         self.x_format = fmt if (fmt != FMT_ABSOLUTE or t_ref is not None) else FMT_RELATIVE
-        self.t_ref = t_ref
+        self.t_ref = TimeRef.of(t_ref)
         self.xaxis.set_format(self.x_format, t_ref)
         self.plot.getPlotItem().setLabel("bottom", label)
 
@@ -433,8 +433,7 @@ class PlotPanel(QWidget):
             return format_duration(v, 6)
         if self.x_format == FMT_ABSOLUTE and self.t_ref is not None:
             try:
-                t = _dt.datetime.fromtimestamp(self.t_ref + v)
-                return t.strftime("%Y-%m-%d %H:%M:%S.%f")
+                return self.t_ref.label(v, 9, "%Y-%m-%d %H:%M:%S")  # ns resolution
             except (OverflowError, OSError, ValueError):
                 return format_si(v, 10)
         return format_si(v, 10)

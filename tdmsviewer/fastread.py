@@ -178,16 +178,47 @@ class FastChannelReader:
             v = ve
 
 
-def nptdms_read(channel, start: int, count: int):
-    """channel.read_data(start, count) with a work-around for truncated files.
+def _segment_ends(channel):
+    """Value count at the end of each npTDMS segment of a channel, or None."""
+    try:
+        rd = channel._reader
+        path = channel.path
+        if path not in rd._segment_channel_offsets:
+            rd._build_index(path)
+        _first, offs = rd._segment_channel_offsets[path]
+        return np.unique(np.asarray(offs, dtype=np.int64))
+    except Exception:
+        return None
 
-    npTDMS 1.11 raises ValueError ("could not broadcast") when a channel has
-    no values in the cut final chunk. Reading to the end works; slice it.
+
+def nptdms_read(channel, start: int, count: int):
+    """channel.read_data(start, count) with work-arounds for two npTDMS 1.11 bugs.
+
+    1. A window that starts before a segment without this channel and ends
+       in a later multi-chunk segment over-reads ("could not broadcast").
+    2. A channel with no values in the cut last chunk of a truncated file
+       fails the same way.
+    On error, read segment by segment; read a failing piece to the end.
     """
     try:
         return channel.read_data(start, count)
     except ValueError:
+        pass
+    stop = min(len(channel), start + count)
+    ends = _segment_ends(channel)
+    if ends is None or stop <= start:
         return channel.read_data(start)[:count]
+    pieces = []
+    a = start
+    while a < stop:
+        k = int(np.searchsorted(ends, a, side="right"))
+        b = int(min(stop, ends[k])) if k < ends.size else stop
+        try:
+            pieces.append(np.asarray(channel.read_data(a, b - a)))
+        except ValueError:
+            pieces.append(np.asarray(channel.read_data(a))[: b - a])
+        a = b
+    return pieces[0] if len(pieces) == 1 else np.concatenate(pieces)
 
 
 def _segment_flag(seg, name: str) -> bool:

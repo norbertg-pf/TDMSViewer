@@ -43,10 +43,13 @@ class Stats:
 
     @property
     def rms(self) -> float:
-        """Root mean square of the samples."""
+        """Root mean square of the samples (Inf if a sample is +/-Inf)."""
         if self.n == 0:
             return float("nan")
-        return math.sqrt(max(0.0, self.mean * self.mean + self.m2 / self.n))
+        if math.isinf(self.min) or math.isinf(self.max):
+            return math.inf
+        v = self.mean * self.mean + self.m2 / self.n
+        return math.nan if math.isnan(v) else math.sqrt(max(0.0, v))
 
     @property
     def p2p(self) -> float:
