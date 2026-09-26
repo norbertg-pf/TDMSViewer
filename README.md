@@ -4,10 +4,23 @@ Fast, read-only viewer for NI TDMS files on Ubuntu. It has the functions
 of the NI "TDMS File Viewer" and adds tools for fast analysis. It is
 free and open source (Python, Qt).
 
+Run from the source folder:
+
 ```bash
-packaging/install-ubuntu.sh          # once: installs the viewer for your user
-tdmsviewer measurement.tdms          # or double-click a .tdms file
+python3 -m pip install -r requirements.txt   # once
+python3 main.py measurement.tdms             # the file is optional
 ```
+
+Or install it for your user (command `tdmsviewer`, menu entry, double-click
+on `.tdms` files):
+
+```bash
+packaging/install-ubuntu.sh
+tdmsviewer measurement.tdms
+```
+
+If Qt reports a missing `xcb` plugin, install the system libraries:
+`sudo apt-get install libxcb-cursor0 libxkbcommon-x11-0 libegl1`.
 
 ## Main points
 
