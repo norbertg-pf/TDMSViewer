@@ -298,6 +298,17 @@ class TdmsSource:
             a = a.astype(a.dtype.newbyteorder("="))
         return a
 
+    def read_into(self, cid: int, out: np.ndarray, start: int) -> None:
+        """Fill out with native values of channel cid from start."""
+        fast = self._fast[cid]
+        if fast is not None and out.dtype == fast.dtype and out.flags.c_contiguous:
+            fast.read_into(out, start)
+            return
+        a = self.read(cid, start, start + out.size)
+        if a.size != out.size:
+            raise IOError(f"short read: {a.size} of {out.size} values")
+        out[:] = a
+
     def data_chunks(self):
         """Yield (channel id, offset, values) for all channels in file order."""
         by_key = {(c.group_name, c.name): i for i, c in enumerate(self._channels)}

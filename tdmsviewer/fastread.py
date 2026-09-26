@@ -72,8 +72,17 @@ class FastChannelReader:
         start = max(0, start)
         stop = min(self.length, stop)
         out = np.empty(max(0, stop - start), dtype=self.dtype)
-        if stop <= start:
-            return out
+        if stop > start:
+            self.read_into(out, start)
+        return out
+
+    def read_into(self, out: np.ndarray, start: int) -> None:
+        """Fill out (1-D, C-contiguous, this dtype) with values from start."""
+        stop = start + out.size
+        if start < 0 or stop > self.length:
+            raise IndexError("read outside the channel")
+        if out.size == 0:
+            return
         i = int(np.searchsorted(self._starts, start, side="right")) - 1
         w = 0
         parts = self._parts

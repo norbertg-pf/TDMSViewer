@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 import os
 import threading
+from concurrent import futures
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -34,7 +35,8 @@ from .xaxis import ArrayMap, LinearMap
 BLOCK = 1 << 22  # samples per load step
 PYR_BASE_RAM = 256
 PYR_MIN_LEN = 4096  # no pyramid below this length (raw decimation is cheap)
-RAW_DECIMATE_MAX = 1 << 24  # max raw samples to decimate on demand
+RAW_DECIMATE_MAX = 1 << 24  # max raw samples for statistics on demand
+RAW_PLOT_MAX = 1 << 21  # max raw samples for one plot update
 XY_MAX_POINTS = 1_000_000
 
 
@@ -183,6 +185,8 @@ class DataEngine(QObject):
         self._stores_gen = -1
         self._bg = None
         self._priority: list[int] = []
+        self._pool = futures.ThreadPoolExecutor(max_workers=max(1, min(4, (os.cpu_count() or 2) - 2)),
+                                                thread_name_prefix="tdms-pyramid")
         self._thread = threading.Thread(target=self._run, name="tdms-engine", daemon=True)
         self._thread.start()
 
@@ -252,6 +256,7 @@ class DataEngine(QObject):
             self._slots.clear()
             self._cv.notify()
         self._thread.join(timeout=3.0)
+        self._pool.shutdown(wait=False, cancel_futures=True)
 
     # -- worker loop ----------------------------------------------------------------
 
@@ -372,6 +377,7 @@ class DataEngine(QObject):
         chunk_pass = [s for s in stores if mixed and s.fast is None and s.info.length]
         chunk_ids = {s.info.id for s in chunk_pass}
         todo = [s for s in stores if s.info.id not in chunk_ids]
+        builds: list = []
 
         def emit_progress(text):
             nonlocal last_emit
@@ -399,23 +405,43 @@ class DataEngine(QObject):
                 ok = first[~np.isnat(first)]
                 st.t0 = ok[0].astype("datetime64[us]") if ok.size else np.datetime64(0, "us")
             plottable = info.plottable
-            arr = np.empty(n, dtype=info.dtype) if st.to_ram else None
+            label = info.label
+            if st.to_ram:
+                arr = np.empty(n, dtype=info.dtype)
+                for i in range(0, n, BLOCK):
+                    if gen != self._stores_gen:
+                        return
+                    src.read_into(info.id, arr[i:min(n, i + BLOCK)], i)
+                    done_bytes += min(BLOCK, n - i) * _itemsize(info)
+                    emit_progress(f"Loading {label}")
+                    yield
+                st.ram = arr
+                if plottable and n >= PYR_MIN_LEN:
+                    # Build the pyramid on a helper thread; read the next channel now.
+                    st.pyr = pyr.Pyramid(n, st.base)
+                    builds.append(self._pool.submit(self._build_pyramid, gen, st, arr))
+                else:
+                    st.done = True
+                    self.channelsUpdated.emit(gen, [info.id])
+                yield
+                continue
             p = pyr.Pyramid(n, st.base) if plottable and n >= PYR_MIN_LEN else None
             st.pyr = p
-            label = info.label
+            if p is not None and st.fast is not None:
+                # Fast reads are thread-safe: stream on a helper thread.
+                builds.append(self._pool.submit(self._stream_pyramid, gen, st))
+                done_bytes += n * _itemsize(info)
+                yield
+                continue
             for i in range(0, n, BLOCK):
                 if gen != self._stores_gen:
                     return
                 a = src.read(info.id, i, min(n, i + BLOCK))
-                if arr is not None:
-                    arr[i:i + a.size] = a
                 if p is not None:
                     p.append(to_f64(a, info.kind, st.t0))
                 done_bytes += a.size * _itemsize(info)
                 emit_progress(f"Loading {label}")
                 yield
-            if arr is not None:
-                st.ram = arr
             st.done = True
             self.channelsUpdated.emit(gen, [info.id])
             yield
@@ -456,10 +482,46 @@ class DataEngine(QObject):
                 st.done = True
             self.channelsUpdated.emit(gen, sorted(chunk_ids))
 
+        while builds:
+            if gen != self._stores_gen:
+                return
+            _done, rest = futures.wait(builds, timeout=0.02)
+            for f in _done:
+                if f.exception() is not None:
+                    self.message.emit(gen, f"Pyramid build failed: {f.exception()}")
+            builds = list(rest)
+            emit_progress("Building overview")
+            yield
         for w in src.drain_warnings():
             self.message.emit(gen, w)
         dt = time.perf_counter() - t_start
         self.progress.emit(gen, 1.0, f"Loaded {total / 1e6:.1f} MB in {dt:.2f} s")
+
+    def _build_pyramid(self, gen: int, st: _Store, arr: np.ndarray) -> None:
+        """Helper thread: pyramid of a finished RAM array."""
+        p = st.pyr
+        info = st.info
+        for i in range(0, arr.size, BLOCK):
+            if gen != self._stores_gen:
+                return
+            p.append(to_f64(arr[i:i + BLOCK], info.kind, st.t0))
+        st.done = True
+        self.channelsUpdated.emit(gen, [info.id])
+
+    def _stream_pyramid(self, gen: int, st: _Store) -> None:
+        """Helper thread: pyramid of a disk channel via the fast reader."""
+        p = st.pyr
+        info = st.info
+        n = info.length
+        buf = np.empty(min(n, BLOCK), dtype=st.fast.dtype)
+        for i in range(0, n, BLOCK):
+            if gen != self._stores_gen:
+                return
+            blk = buf[: min(BLOCK, n - i)]
+            st.fast.read_into(blk, i)
+            p.append(to_f64(blk, info.kind, st.t0))
+        st.done = True
+        self.channelsUpdated.emit(gen, [info.id])
 
     # -- reading helpers (worker) ---------------------------------------------------
 
@@ -487,7 +549,9 @@ class DataEngine(QObject):
         px = max(16, int(req.pixels))
         for it in req.items:
             if self._pending("plot"):
-                return  # a newer view exists
+                if out:  # a newer view exists: deliver what is done
+                    self.plotReady.emit(gen, req.seq, out)
+                return
             st = self._stores[it.cid]
             if not st.info.plottable:
                 continue
@@ -515,20 +579,32 @@ class DataEngine(QObject):
         b = pyr.floor_pow2(n / px)
         p = st.pyr
         rr = lambda a, z: self._read_f64(st, a, z)  # noqa: E731
-        if p is not None and b >= p.base and p.covered >= i1:
-            c, mn, mx = p.minmax(i0, i1, b, rr)
-            complete = True
-        elif self._can_read_cheap(st, n):
+        if p is not None and b >= p.base:
+            if p.covered >= i1:
+                c, mn, mx = p.minmax(i0, i1, b, rr)
+                complete = True
+            elif n <= self._raw_plot_max(st):
+                c, mn, mx = pyr.raw_minmax(self._read_f64(st, i0, i1), i0, b)
+                complete = True
+            else:
+                # Still loading: draw the finished part, refine later.
+                c, mn, mx = p.minmax(i0, i1, b, rr)
+                complete = False
+        elif p is None and n > self._raw_plot_max(st) * 8:
+            return None
+        else:
+            # Bucket smaller than the pyramid base: n < base * px samples.
             c, mn, mx = pyr.raw_minmax(self._read_f64(st, i0, i1), i0, b)
             complete = True
-        elif p is not None:
-            # Too many raw samples to read now: pyramid at its own resolution.
-            c, mn, mx = p.minmax(i0, i1, max(b, p.base), rr)
-            complete = p.covered >= i1
-        else:
-            return None
         x, yy = pyr.interleave(c, mn, mx)
         return xmap.index_to_x(x), yy, complete
+
+    @staticmethod
+    def _raw_plot_max(st: _Store) -> int:
+        """Max raw samples for one plot update (keeps an update below ~10 ms)."""
+        if st.ram is not None:
+            return RAW_PLOT_MAX * 4  # RAM: compute only, no I/O
+        return RAW_PLOT_MAX if st.fast is not None else RAW_PLOT_MAX // 8
 
     def _plot_xy(self, st: _Store, xmap: ArrayMap, s: int, e: int):
         n = e - s

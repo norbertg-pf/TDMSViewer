@@ -401,6 +401,7 @@ class MainWindow(QMainWindow):
             return
         self.settings.setValue("last_dir", os.path.dirname(path))
         self.path_edit.setText(path)
+        self.path_edit.setToolTip(path)
         self._clear_view()
         self.gen = self.engine.open(path)
         self._set_status(f"Opening {os.path.basename(path)} ...")
@@ -752,7 +753,7 @@ class MainWindow(QMainWindow):
     def _set_default_format(self) -> None:
         src, cid = self.x_source
         if src == SRC_WAVE:
-            fmt = FMT_RELATIVE
+            fmt = FMT_ABSOLUTE if self._t_ref() is not None else FMT_RELATIVE
         elif src == SRC_CHAN and self.model is not None and self.model.channels[cid].kind == KIND_TIME:
             fmt = FMT_ABSOLUTE
         else:

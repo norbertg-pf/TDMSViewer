@@ -14,6 +14,9 @@ def main(argv: list[str] | None = None) -> int:
 
     from PySide6.QtWidgets import QApplication
 
+    # GUI and engine threads share the GIL: switch more often (default 5 ms).
+    sys.setswitchinterval(0.002)
+
     app = QApplication([sys.argv[0], *qt_args])
     app.setApplicationName("TDMS Viewer")
     app.setOrganizationName("tdmsviewer")
