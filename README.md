@@ -34,7 +34,11 @@ If Qt reports a missing `xcb` plugin, install the system libraries:
   screen pixel column. A one-sample spike is never hidden. Zoom and pan stay
   fast on files larger than RAM.
 - **Exact values.** Tables show the stored value with full precision.
-  Statistics are exact for any range.
+  Statistics are exact for any range (relative error ~1e-16). Timestamps
+  are exact to 1 ns (npTDMS alone rounds to 1 µs). int64/uint64 values stay
+  exact integers.
+- **Nothing is hidden.** ±Inf samples are drawn as red triangles. Samples
+  with NaN (dropouts) break the line, also when zoomed out.
 - **Read-only.** The viewer never writes to a TDMS file.
 
 ## Functions
@@ -44,13 +48,13 @@ If Qt reports a missing `xcb` plugin, install the system libraries:
 | Open | `...` button, Ctrl+O, drag and drop, recent files, F5 reload |
 | Select data | Tree: file = all channels, group = its channels, channel = one. Ctrl/Shift-click for more |
 | Range | Start index, Samples, All (All is on by default) |
-| Graph palette | Zoom to fit, zoom box, zoom X, zoom Y, pan, previous view |
+| Graph palette | Zoom to fit, zoom box, zoom X, zoom Y, zoom about point, pan, previous view |
 | Mouse | Wheel zoom (Shift: X, Ctrl: Y), middle drag pan, double-click fit |
-| Legend | Checkbox per plot, right-click: show all / hide all / show only |
+| Legend | Checkbox per plot. Right-click: show all / hide all / show only, color, line width, line / points |
 | X axis | Waveform time (`wf_increment`), sample index, or any channel (for example `Time`). Labels: number, relative time (HH:MM:SS.fff), absolute local time |
 | X-Y plot | Select a channel that is not monotonic as X (for example current) |
 | Cursors | Two cursors (C key). Readout of x, Δx, 1/Δx. Table follows cursor 1 |
-| Statistics | Tab "Statistics": N, min, max, peak-peak, mean, std dev, RMS, cursor values, for the visible range or between the cursors |
+| Statistics | Tab "Statistics": N, NaN count, min, max, peak-peak, mean, std dev, RMS, cursor values, C2 − C1, for the visible range or between the cursors |
 | Values table | Lazy, up to 2^31 rows. Ctrl+C copies with full precision |
 | Properties | NI order (ASCII sort), NI_ChannelLength, NI_DataType, filter box |
 | Export | Ctrl+E: visible range as CSV (full resolution); graph image: right-click > Export |
