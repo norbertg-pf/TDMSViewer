@@ -366,12 +366,23 @@ def test_background_load_progress_and_updates(drv, main_file):
     assert drv.rec.of("message", gen) == []
 
 
-def test_priority_channel_loads_first(drv, main_file):
+def test_priority_channel_loads_first(drv, main_file, monkeypatch):
+    from tdmsviewer import tdmsfile
+
+    order = []
+    real_into = tdmsfile.TdmsSource.read_into
+
+    def spy(self, cid, out, start):
+        if cid not in order:
+            order.append(cid)
+        return real_into(self, cid, out, start)
+
+    monkeypatch.setattr(tdmsfile.TdmsSource, "read_into", spy)
     first = [main_file.ids["Misc/cplx"], main_file.ids["Time/Time"]]
     drv.eng.set_priority(first)
     gen, _ = drv.open(main_file.path)
-    order = [cids for g, cids in drv.rec.of("channelsUpdated", gen)]
-    assert order[0] == [first[0]] and order[1] == [first[1]]
+    assert order[:2] == first
+    assert sorted(order) == sorted(c for k, c in main_file.ids.items() if main_file.data[k].size)
 
 
 # -- plot: envelope, spikes, raw ---------------------------------------------------
@@ -407,17 +418,29 @@ def test_plot_spikes_are_preserved(drv, main_file):
     cid = main_file.ids["Wave/sig"]
     xm = LinearMap(X0, DX)
     sig = main_file.f64("Wave/sig")
-    for px in (16, 37, 100, 256, 640, 1000, 3000):
-        x, y, complete = drv.plot([PlotItem(cid, xm, 0, N)], X0, X0 + (N - 1) * DX, px)[cid]
+    xa, xb = X0, X0 + (N - 1) * DX
+    i0, i1 = xm.index_range(xa, xb, 0, N)
+    for px in (16, 37, 100, 256, 300, 640, 1000, 3000):
+        x, y, complete = drv.plot([PlotItem(cid, xm, 0, N)], xa, xb, px)[cid]
         assert complete
         assert y.size < N // 10
+        edges = check_envelope(x, y, sig, i0, i1, lin_to_index(xm))
         for i in (*UP, *DOWN):
-            hit = np.nonzero(y == sig[i])[0]
-            assert hit.size >= 1, f"spike at {i} lost with {px} px"
-            # The spike is drawn near its own position.
-            xi = X0 + i * DX
-            width = (N / px) * 2 * DX
-            assert np.min(np.abs(x[hit] - xi)) <= width
+            k = int(np.searchsorted(edges, i, side="right")) - 1
+            lo, hi = y[2 * k], y[2 * k + 1]
+            if i in UP:
+                assert hi >= sig[i], f"spike at {i} lost with {px} px"
+            else:
+                assert lo <= sig[i], f"spike at {i} lost with {px} px"
+            blk = sig[edges[k]:edges[k + 1]]
+            if sig[i] in (np.nanmax(blk), np.nanmin(blk)):
+                # The spike is the extreme of its bucket: drawn with its exact value, near its x.
+                hit = np.nonzero(y == sig[i])[0]
+                assert hit.size >= 1
+                assert np.min(np.abs(x[hit] - (X0 + i * DX))) <= (edges[k + 1] - edges[k]) * DX
+        if px >= 300:  # bucket <= 256 samples: every positive spike is alone in its bucket
+            for i in UP:
+                assert sig[i] in y
         assert np.nanmax(y) == np.nanmax(sig) and np.nanmin(y) == np.nanmin(sig)
 
 
@@ -455,9 +478,10 @@ def test_plot_raw_zoom_exact_samples_and_x(drv, main_file):
     for label in ("Wave/i32", "Wave/f32", "Misc/flag", "Misc/cplx"):
         cid = main_file.ids[label]
         xm1 = LinearMap(0.0, 1.0)
+        # index_range adds one sample on each side: [floor(100) - 1, ceil(300) + 2).
         x, y, complete = drv.plot([PlotItem(cid, xm1, 0, model.channels[cid].length)], 100.0, 300.0, 200)[cid]
-        np.testing.assert_array_equal(x, np.arange(99, 303, dtype=np.float64))
-        want = main_file.data[label][99:303]
+        np.testing.assert_array_equal(x, np.arange(99, 302, dtype=np.float64))
+        want = main_file.data[label][99:302]
         want = np.abs(want) if want.dtype.kind == "c" else want.astype(np.float64)
         np.testing.assert_array_equal(y, want)
 
@@ -478,21 +502,50 @@ def test_plot_item_sample_window(drv, main_file):
             assert x.min() >= X0 + (s - 0.5) * DX and x.max() <= X0 + (e - 0.5) * DX
 
 
-def test_plot_pyramid_only_branch(drv, main_file, monkeypatch):
-    """Raw decimation too expensive: pyramid at its own resolution, still exact."""
-    monkeypatch.setattr(eng_mod, "RAW_DECIMATE_MAX", 4096)
-    gen, model = drv.open(main_file.path)
+def test_plot_and_stats_while_pyramid_builds(drv, main_file, monkeypatch):
+    """Answers during the pyramid build are exact for the part that is covered."""
+    import time
+
+    from tdmsviewer import pyramid
+
+    monkeypatch.setattr(eng_mod, "BLOCK", 4096)
+    monkeypatch.setattr(eng_mod, "RAW_PLOT_MAX", 256)  # raw plot limit: 1024 RAM samples
+    real_append = pyramid.Pyramid.append
+
+    def slow_append(self, block):
+        time.sleep(0.003)
+        return real_append(self, block)
+
+    monkeypatch.setattr(pyramid.Pyramid, "append", slow_append)
     cid = main_file.ids["Wave/sig"]
+    drv.eng.set_priority([cid])
+    gen, model = drv.open(main_file.path, loaded=False)
     xm = LinearMap(X0, DX)
     sig = main_file.f64("Wave/sig")
-    for ia, ib, px in ((0, N - 1, 1000), (0, N - 1, 5000), (10_000.5, 90_000.5, 2000)):
-        xa, xb = X0 + ia * DX, X0 + ib * DX
-        x, y, complete = drv.plot([PlotItem(cid, xm, 0, N)], xa, xb, px)[cid]
-        assert complete
-        i0, i1 = xm.index_range(xa, xb, 0, N)
-        edges = check_envelope(x, y, sig, i0, i1, lin_to_index(xm))
-        inner = np.diff(edges)[1:-1]
-        assert np.all(inner == 256), "pyramid buckets have the pyramid base size"
+    xa, xb = X0, X0 + (N - 1) * DX
+    i0, i1 = xm.index_range(xa, xb, 0, N)
+    seen = {"none": 0, "partial": 0, "complete": 0}
+    for _ in range(2000):
+        res = drv.plot([PlotItem(cid, xm, 0, N)], xa, xb, 100)[cid]
+        if res is None:
+            seen["none"] += 1
+        else:
+            x, y, complete = res
+            if x.size:
+                check_envelope(x, y, sig, i0, i1, lin_to_index(xm), complete=complete)
+            else:
+                assert not complete
+            seen["complete" if complete else "partial"] += 1
+        st = drv.stats([PlotItem(cid, xm, 0, N)], X0 + 10.5 * DX, X0 + 140_000.5 * DX)[cid]["stats"]
+        assert_stats(st, ref_stats(sig[11:140_001]))
+        if res is not None and res[2]:
+            break
+    assert seen["partial"] >= 1, seen
+    assert seen["complete"] == 1
+    drv.wait_loaded(gen)
+    x, y, complete = drv.plot([PlotItem(cid, xm, 0, N)], xa, xb, 100)[cid]
+    assert complete
+    check_envelope(x, y, sig, i0, i1, lin_to_index(xm))
 
 
 # -- plot: X from a channel ------------------------------------------------------------
@@ -589,12 +642,40 @@ def test_x_request_errors(drv, main_file, monkeypatch):
     assert isinstance(msg, str) and "too large" in msg
 
 
+def test_unknown_channel_ids_are_skipped(drv, main_file):
+    """Plot and statistics requests skip unknown channel ids, like table requests do."""
+    gen, model = drv.open(main_file.path)
+    ok = main_file.ids["Wave/i32"]
+    xm = LinearMap(0.0, 1.0)
+    items = [PlotItem(ok, xm, 0, N), PlotItem(len(model.channels), xm, 0, N), PlotItem(-1, xm, 0, N)]
+    eng = drv.eng
+    eng.request_plot(PlotRequest(501, items, 0.0, 100.0, 100))
+    eng.request_stats(StatsRequest(502, items, 0.0, 100.0))
+    eng.request_table(TableRequest(503, [ok, len(model.channels), -1], 0, 10))
+    got = {}
+
+    def answered():
+        for name, seq in (("plotReady", 501), ("statsReady", 502), ("tableReady", 503)):
+            a = drv.rec.find(name, lambda g, s, o, _q=seq: g == gen and s == _q)
+            if a is not None:
+                got[name] = a[2]
+        return len(got) == 3 or bool(drv.rec.errors())
+
+    drv.qtbot.waitUntil(answered, timeout=10_000)
+    errors = [m for _, m in drv.rec.errors()]
+    drv.rec.events = [e for e in drv.rec.events if not (e[0] == "message" and "Internal error" in e[1][1])]
+    assert set(got.get("tableReady", {})) == {ok}
+    assert errors == [], f"engine error for an unknown channel id: {errors}"
+    assert set(got["plotReady"]) == {ok}, "unknown ids must not be answered (cid -1 must not map to the last channel)"
+    assert set(got["statsReady"]) == {ok}
+
+
 # -- statistics ------------------------------------------------------------------
 
 STAT_RANGES = [  # sample index ranges (first, last)
     (0, N - 1), (12_345.5, 98_765.2), (12_345, 98_765), (100.0, 300.0), (255.0, 257.0),
     (60_000, 60_600), (59_990.2, 60_610.8), (-100, 50.5), (N - 10.5, N + 100), (N + 5, N + 10),
-    (49_999.5, 100_000.5), (1.2, 1.8),
+    (49_999.5, 100_000.5), (1.2, 1.8), (500.0, 400.0),
 ]
 
 
@@ -743,14 +824,17 @@ def test_second_open_drops_first_file(drv, big_file, small_file, monkeypatch):
     # Posted before the worker opened B: must be answered for B.
     drv.eng.request_plot(PlotRequest(2, [PlotItem(0, LinearMap(0.0, 0.1), 0, 1000)], 1.0, 5.0, 300))
     res = drv.wait("plotReady", lambda g, s, o: g == gen_b and s == 2)[2]
-    x, y, complete = res[0]
-    np.testing.assert_array_equal(y, small_file.data["B/z"][9:53])
+    assert set(res) == {0}
+    check_plot(res[0], small_file.f64("B/z"), LinearMap(0.0, 0.1), 1.0, 5.0, 300)
     drv.wait_loaded(gen_b)
     ev = drv.rec.events
     k_open_b = ev.index(("opened", drv.rec.find("opened", lambda g, m: g == gen_b)))
-    late = [(n, a[0]) for n, a in ev[k_open_b:] if a[0] == gen_a]
-    assert late == [], "no signal of the old file after the new file was opened"
+    # After B is open the worker sends nothing for A. Pyramid helper threads may
+    # still report a channel of A; it carries gen A, so the GUI drops it.
+    late = [(n, a[0]) for n, a in ev[k_open_b:] if a[0] == gen_a and n != "channelsUpdated"]
+    assert late == [], "no answer or progress of the old file after the new file was opened"
     assert all(a[0] in (gen_a, gen_b) for _, a in ev)
+    assert not any(n in ("plotReady", "tableReady") and a[0] == gen_b and a[1] == 1 for n, a in ev)
     assert drv.eng.try_read(gen_a, 0, 0, 10) is None
     assert drv.rec.of("plotReady", gen_b)[0][1] == 2
 
@@ -802,6 +886,33 @@ def test_latest_request_wins(drv, main_file):
     last = drv.rec.of("plotReady", gen)[-1][2][cid]
     again = drv.plot([PlotItem(cid, xm, 0, N)], X0 + ia * DX, X0 + ib * DX, px)[cid]
     assert nan_equal(last[0], again[0]) and nan_equal(last[1], again[1])
+
+
+def test_latest_request_wins_multi_item(drv, main_file):
+    """Multi-item requests: an old answer may hold only some items; each is correct."""
+    gen, model = drv.open(main_file.path)
+    labels = ["Wave/sig", "Wave/offset", "Wave/i32", "Wave/f32", "Wave/XY", "Time/Time"]
+    cids = [main_file.ids[k] for k in labels]
+    xm = LinearMap(X0, DX)
+    rng = np.random.default_rng(9)
+    views = []
+    for k in range(1, 61):
+        ia = float(rng.uniform(0, N / 2))
+        ib = float(rng.uniform(ia + 100, N))
+        px = int(rng.integers(16, 2000))
+        views.append((ia, ib, px))
+        drv.eng.request_plot(PlotRequest(k, [PlotItem(c, xm, 0, N) for c in cids], X0 + ia * DX, X0 + ib * DX, px))
+    drv.wait("plotReady", lambda g, s, o: g == gen and s == 60)
+    drv.qtbot.wait(200)
+    answers = drv.rec.of("plotReady", gen)
+    assert [s for _, s, _ in answers] == sorted({s for _, s, _ in answers})
+    assert answers[-1][1] == 60 and set(answers[-1][2]) == set(cids)
+    for _, s, out in answers:
+        assert out, "an answer is never empty"
+        assert list(out) == cids[:len(out)], "items are answered in request order"
+        ia, ib, px = views[s - 1]
+        for c in out:
+            check_plot(out[c], main_file.f64(labels[cids.index(c)]), xm, X0 + ia * DX, X0 + ib * DX, px)
 
 
 # -- export ------------------------------------------------------------------------
@@ -878,31 +989,46 @@ def test_export_csv_arraymap_and_errors(drv, main_file, tmp_path):
     assert msg.startswith("Export failed")
 
 
-def test_arraymap_x_next_to_nan_sample(drv, tmp_path):
-    """X channel with a NaN: samples next to the NaN keep their own x value.
+X_NAN = np.array([0.0, 1.0, np.nan, 3.0, 2.0, 5.0, np.inf, 7.0])  # X channel with NaN and Inf
 
-    Export and cursor readout use ArrayMap.index_to_x()/x_of() at integer
-    indices. x[i] must not depend on x[i + 1].
-    """
-    X = np.array([0.0, 1.0, np.nan, 3.0, 2.0, 5.0, np.inf, 7.0])
-    Y = np.arange(X.size, dtype=np.float64) * 10.0
+
+@pytest.fixture
+def xnan_file(tmp_path):
     path = tmp_path / "xnan.tdms"
-    write_segments(path, [[("g", "X", X, {}), ("g", "Y", Y, {})]])
-    gen, model = drv.open(path)
+    write_segments(path, [[("g", "X", X_NAN, {}), ("g", "Y", np.arange(X_NAN.size, dtype=np.float64) * 10.0, {})]])
+    return path
+
+
+def test_xy_plot_with_nan_in_x(drv, xnan_file):
+    gen, model = drv.open(xnan_file)
     _, amap, _ = drv.xmap(0)
     assert not amap.monotonic
-    # XY plot uses the x values directly.
-    x, y, _ = drv.plot([PlotItem(1, amap, 0, X.size)], -10, 10, 100)[1]
-    assert nan_equal(x, X) and nan_equal(y, Y)
+    x, y, _ = drv.plot([PlotItem(1, amap, 0, X_NAN.size)], -10, 10, 100)[1]
+    assert nan_equal(x, X_NAN) and nan_equal(y, np.arange(X_NAN.size) * 10.0)
+
+
+def test_export_x_column_next_to_nan_x(drv, xnan_file, tmp_path):
+    """Export: x of sample i is X[i], also when X[i + 1] is NaN or Inf."""
+    gen, model = drv.open(xnan_file)
+    _, amap, _ = drv.xmap(0)
     out = tmp_path / "xnan.csv"
-    drv.export(out, [PlotItem(1, amap, 0, X.size)], -10, 10, ["i", "x", "y"])
+    msg = drv.export(out, [PlotItem(1, amap, 0, X_NAN.size)], -10, 10, ["i", "x", "y"])
+    assert msg.startswith("Exported 8 rows")
     rows = _read_csv(out)[1:]
+    assert [r[0] for r in rows] == [str(i) for i in range(8)]
     got_x = [float(r[1]) for r in rows]
-    assert nan_equal(got_x, X), f"export x column {got_x} != X {X.tolist()}"
-    res = drv.stats([PlotItem(1, amap, 0, X.size)], -10, 10, [0.9])[1]
-    k, xk, v = res["cursors"][0]
-    assert (k, v) == (1, 10.0)
-    assert xk == 1.0, f"cursor x of sample 1 is {xk}, X[1] is 1.0"
+    assert nan_equal(got_x, X_NAN), f"export x column {got_x} != X {X_NAN.tolist()}"
+
+
+def test_cursor_x_next_to_nan_x(drv, xnan_file):
+    """Cursor readout: x of the nearest sample is X[k], also when X[k + 1] is NaN."""
+    gen, model = drv.open(xnan_file)
+    _, amap, _ = drv.xmap(0)
+    res = drv.stats([PlotItem(1, amap, 0, X_NAN.size)], -10, 10, [0.9, 4.9])[1]
+    assert res["range"] == (0, 8)
+    (k1, x1, v1), (k2, x2, v2) = res["cursors"]
+    assert (k1, v1, k2, v2) == (1, 10.0, 5, 50.0)
+    assert (x1, x2) == (1.0, 5.0), f"cursor x values {(x1, x2)}, want X[1] = 1.0 and X[5] = 5.0"
 
 
 # -- interleaved files (npTDMS data_chunks pass) -------------------------------------
@@ -1184,47 +1310,6 @@ def test_truncated_file_warnings(drv, tmp_path):
     np.testing.assert_array_equal(drv.table([0], 0, n)[0][1], y[:n])
 
 
-# -- loading while answering requests ------------------------------------------------
-
-def test_plot_during_load_is_valid(drv, main_file, monkeypatch):
-    """Answers during the load are exact for the part that is covered."""
-    from tdmsviewer import tdmsfile
-
-    monkeypatch.setattr(eng_mod, "BLOCK", 2048)
-    monkeypatch.setattr(eng_mod, "RAW_DECIMATE_MAX", 4096)  # force the pyramid-only path
-    real_read = tdmsfile.TdmsSource.read
-
-    def slow_read(self, cid, a, b):
-        import time
-
-        time.sleep(0.001)
-        return real_read(self, cid, a, b)
-
-    monkeypatch.setattr(tdmsfile.TdmsSource, "read", slow_read)
-    cid = main_file.ids["Wave/sig"]
-    drv.eng.set_priority([cid])
-    gen, model = drv.open(main_file.path, loaded=False)
-    xm = LinearMap(X0, DX)
-    sig = main_file.f64("Wave/sig")
-    seen = {"none": 0, "partial": 0, "complete": 0}
-    for _ in range(400):
-        done = drv.rec.find("progress", lambda g, f, t: g == gen and f >= 1.0) is not None
-        res = drv.plot([PlotItem(cid, xm, 0, N)], X0, X0 + (N - 1) * DX, 1000)[cid]
-        if res is None:
-            seen["none"] += 1
-        else:
-            x, y, complete = res
-            i0, i1 = xm.index_range(X0, X0 + (N - 1) * DX, 0, N)
-            if x.size:
-                check_envelope(x, y, sig, i0, i1, lin_to_index(xm), complete=complete)
-            seen["complete" if complete else "partial"] += 1
-        if done:
-            break
-    assert seen["complete"] >= 1
-    assert seen["partial"] + seen["none"] >= 1, seen
-    drv.wait_loaded(gen)
-
-
 # -- shutdown ------------------------------------------------------------------------
 
 def test_shutdown_joins_thread(qtbot, main_file):
@@ -1249,11 +1334,15 @@ def test_shutdown_during_load(qtbot, big_file, monkeypatch):
     eng = DataEngine()
     d = Driver(qtbot, eng)
     gen, model = d.open(big_file.path, loaded=False)
+    qtbot.waitUntil(lambda: bool(d.rec.of("progress", gen)[1:]), timeout=10_000)  # loading
     t = time.perf_counter()
     eng.shutdown()
     assert time.perf_counter() - t < 3.0
     assert not eng._thread.is_alive()
     assert eng._source is None
+    # Pyramid helper threads stop at their next block.
+    helpers = list(getattr(eng, "_pool", None)._threads) if getattr(eng, "_pool", None) else []
+    qtbot.waitUntil(lambda: not any(h.is_alive() for h in helpers), timeout=5_000)
 
 
 def test_shutdown_idle_engine(qtbot):

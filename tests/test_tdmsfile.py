@@ -252,14 +252,82 @@ def test_special_names(write_tdms, open_source, rng):
     check_source_against_nptdms(src, tb.nptdms_full(path), rng, count=5)
 
 
-def test_segment_without_raw_flag(write_tdms, open_source, rng):
+def test_metadata_only_segment(write_tdms, open_source, rng):
+    """A segment with only metadata (no kTocRawData) updates properties, no data."""
     b = TdmsBuilder()
     p = obj_path("G", "x")
-    b.segment(tb.header_objects(["G"]) + [Obj(p, tb.random_values("f8", 64, rng))])
-    b.segment([Obj(p, index="same")], data={p: tb.random_values("f8", 64, rng)}, raw=False)
-    b.raw_segment({p: tb.random_values("f8", 64, rng)})
+    b.segment(tb.header_objects(["G"]) + [Obj(p, tb.random_values("f8", 64, rng), props={"step": 1})])
+    b.segment([Obj(p, index="same", props={"step": 2})], chunks=0, data={p: []})
+    b.raw_segment({p: tb.random_values("f8", 128, rng)}, chunks=2)
     path = write_tdms(b)
-    check_source_against_nptdms(open_source(path), tb.nptdms_full(path), rng)
+    src = open_source(path)
+    info = src.model.channels[0]
+    assert info.length == 192 and info.fast
+    assert info.properties["step"] == 2
+    check_source_against_nptdms(src, tb.nptdms_full(path), rng)
+    tb.assert_same_values(src.read(0, 0, 192), b.expected(p), p)
+
+
+def _truncated_mixed_types(rng) -> tuple[TdmsBuilder, int]:
+    """Last segment cut inside the first object of the last chunk.
+
+    The later objects (scaled, timestamp, string-free) have no values in
+    the last chunk, so they are read by npTDMS.
+    """
+    b = TdmsBuilder()
+    names = [("value", "f8"), ("stamp", "time"), ("scaled", "i2")]
+
+    def objs(n):
+        out = []
+        for name, kind in names:
+            vals = tb.random_times(n, rng) if kind == "time" else tb.random_values(kind, n, rng)
+            props = tb.linear_scale_props(0.5, 2.0) if name == "scaled" else {}
+            out.append(Obj(obj_path("G", name), vals, props=props))
+        return out
+
+    b.segment(tb.header_objects(["G"]) + objs(40))
+    last = b.segment(objs(40 * 5), chunks=5)
+    chunk = 40 * (8 + 16 + 2)
+    keep = 4 * chunk + 8 * 13 + 5
+    return b, len(last.raw) - keep
+
+
+def test_truncated_file_npTDMS_fallback_channels(write_tdms, open_source, rng):
+    """Scaled and timestamp channels of a crashed (truncated) file must be readable.
+
+    These channels do not use the fast path, so TdmsSource.read calls
+    npTDMS channel.read_data for them.
+    """
+    b, cut = _truncated_mixed_types(rng)
+    path = write_tdms(b, cut=cut)
+    src = open_source(path)
+    by_name = {c.name: c for c in src.model.channels}
+    assert by_name["value"].fast
+    assert not by_name["stamp"].fast and not by_name["scaled"].fast
+    assert by_name["value"].length == 40 + 4 * 40 + 13
+    assert by_name["stamp"].length == by_name["scaled"].length == 40 + 4 * 40
+    check_source_against_nptdms(src, tb.nptdms_full(path), rng)
+
+
+def _crashed_two_channels(rng) -> tuple[TdmsBuilder, int]:
+    """One segment, 4 chunks of [a, b] (600 f8 each), cut inside a of chunk 4."""
+    b = TdmsBuilder()
+    objs = tb.header_objects(["G"]) + [Obj(obj_path("G", "a"), tb.random_values("f8", 2400, rng)),
+                                       Obj(obj_path("G", "b"), tb.random_values("f8", 2400, rng))]
+    last = b.segment(objs, chunks=4)
+    return b, len(last.raw) - (3 * 600 * 16 + 8 * 100)
+
+
+def test_truncated_file_plain_channel_with_empty_last_chunk(write_tdms, open_source, rng):
+    """Plain float64 channel b has no values in the cut chunk: it must stay fast and readable."""
+    b, cut = _crashed_two_channels(rng)
+    path = write_tdms(b, cut=cut)
+    src = open_source(path)
+    a_info, b_info = src.model.channels
+    assert (a_info.length, b_info.length) == (1900, 1800)
+    for a, z in [(0, 1024), (500, 700), (0, 1800), (1799, 1800)]:
+        tb.assert_same_values(src.read(b_info.id, a, z), b.expected(b_info.path)[a:z], f"b [{a}, {z})")
+    assert a_info.fast and b_info.fast
 
 
 # -- warnings ------------------------------------------------------------------------------
@@ -361,7 +429,7 @@ def test_index_of_same_size_but_other_layout(tmp_path, open_source, rng):
     diff = b.size - a.size
     assert diff > 0
     a = TdmsBuilder()
-    a.segment(tb.header_objects(["G"]) + [Obj(p, tb.random_values("f8", 200, rng), props={"tag": "A" * (1 + diff)})])
+    a.segment(tb.header_objects(["G"]) + [Obj(p, tb.random_values("f8", 200, rng), props={"tag": "A" * (4 + diff)})])
     assert a.size == b.size
     path = str(tmp_path / "same_size.tdms")
     b.write(path)
@@ -429,6 +497,7 @@ def _open_fds() -> int:
 
 def test_close_releases_files(scenario):
     path, builder, notes = scenario("contiguous")
+    gc.collect()
     before = _open_fds()
     src = TdmsSource(path)
     assert _open_fds() > before
@@ -439,6 +508,7 @@ def test_close_releases_files(scenario):
 
 def test_close_after_stale_index(write_tdms, rng):
     path = write_tdms(_three_segments(rng), index=2)
+    gc.collect()
     before = _open_fds()
     src = TdmsSource(path)
     src.close()
@@ -448,6 +518,7 @@ def test_close_after_stale_index(write_tdms, rng):
 def test_not_a_tdms_file(tmp_path):
     p = tmp_path / "bad.tdms"
     p.write_bytes(b"this is not a TDMS file at all" * 10)
+    gc.collect()
     before = _open_fds()
     with pytest.raises(Exception):
         TdmsSource(str(p))

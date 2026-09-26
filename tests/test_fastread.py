@@ -344,6 +344,31 @@ def test_verification_rejects_corrupted_layout(kind, name, channel, scenario, op
         make_fast_reader(o.tdms, ch, o.fd)
 
 
+def test_verification_checks_every_segment_kind(write_tdms, opened, rng, monkeypatch):
+    """A layout error in one rare segment kind must be caught.
+
+    30 contiguous segments and one interleaved segment (number 7). A
+    wrong offset only in the interleaved part must fail verification.
+    """
+    b = TdmsBuilder()
+    p, q = obj_path("G", "x"), obj_path("G", "y")
+    b.segment(tb.header_objects(["G"]) + [Obj(p, tb.random_values("f8", 2000, rng)),
+                                          Obj(q, tb.random_values("f8", 2000, rng))])
+    for k in range(1, 30):
+        b.raw_segment({p: tb.random_values("f8", 2000, rng), q: tb.random_values("f8", 2000, rng)},
+                      interleaved=(k == 7))
+    o = opened(write_tdms(b))
+    ch = o.channel(p)
+    parts, base = build_parts(o.tdms, ch)
+    assert sum(q_.item_stride != 8 for q_ in parts) == 1
+    bad = [replace(q_, offset=q_.offset + 8) if q_.item_stride != 8 else q_ for q_ in parts]
+    probe = fastread.FastChannelReader(o.fd, bad, len(ch), base)
+    assert probe.read(0, len(ch)).tobytes() != o.ref_data(ch).tobytes()
+    monkeypatch.setattr(fastread, "build_parts", lambda f, c: (bad, base))
+    with pytest.raises(FastPathError):
+        make_fast_reader(o.tdms, ch, o.fd)
+
+
 def test_verification_windows_cover_joints():
     parts = [fastread._Part(s, 100, 0, 100, 0, 8, np.dtype("<f8")) for s in range(0, 1000, 100)]
     ws = fastread._windows(1000, parts)
@@ -367,6 +392,20 @@ def test_file_shrinking_after_open_gives_clean_error(scenario, opened, tmp_path)
     # A new reader on the shrunken file must not pass verification.
     with pytest.raises(Exception):
         make_fast_reader(o.tdms, ch, o.fd)
+
+
+def test_truncated_file_channel_with_empty_last_chunk(write_tdms, opened, rng):
+    """Channel b has no values in the truncated last chunk. Layout is right; the reader must be built."""
+    b = TdmsBuilder()
+    pa, pb = obj_path("G", "a"), obj_path("G", "b")
+    last = b.segment(tb.header_objects(["G"]) + [Obj(pa, tb.random_values("f8", 2400, rng)),
+                                                 Obj(pb, tb.random_values("f8", 2400, rng))], chunks=4)
+    o = opened(write_tdms(b, cut=len(last.raw) - (3 * 600 * 16 + 8 * 100)))
+    ch = o.channel(pb)
+    parts, _ = build_parts(o.tdms, ch)
+    assert sum(q.count for q in parts) == 1800
+    reader = make_fast_reader(o.tdms, ch, o.fd)
+    check_reader(reader, o.ref_data(ch), rng, msg=pb)
 
 
 def test_empty_channel_reader(write_tdms, opened):
