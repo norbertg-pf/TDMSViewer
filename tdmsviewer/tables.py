@@ -9,7 +9,6 @@ Summary
 
 from __future__ import annotations
 
-import math
 
 import numpy as np
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, QTimer, Signal

@@ -141,6 +141,36 @@ class _Store:
         self.base = base
 
 
+class _Progress:
+    """Load progress, emitted at most 10 times per second."""
+
+    def __init__(self, engine, gen: int, total: int):
+        self.engine, self.gen = engine, gen
+        self.total = max(1, total)
+        self.done = 0
+        self._last = 0.0
+        self._t0 = time.perf_counter()
+
+    def add(self, nbytes: int, text: str) -> None:
+        self.done += nbytes
+        self.step(text)
+
+    def step(self, text: str) -> None:
+        now = time.perf_counter()
+        if now - self._last > 0.1:
+            self._last = now
+            self.engine.progress.emit(self.gen, min(0.999, self.done / self.total), text)
+
+    def elapsed(self) -> float:
+        return time.perf_counter() - self._t0
+
+
+def _first_time(a: np.ndarray):
+    """First valid timestamp of an array (the zero of time-channel plots)."""
+    ok = a[~np.isnat(a)] if a.size else a
+    return ok[0].astype("datetime64[us]") if ok.size else np.datetime64(0, "us")
+
+
 def to_f64(a: np.ndarray, kind: str, t0=None) -> np.ndarray:
     """Plot values (float64) of native channel values."""
     if a.dtype == np.float64:
@@ -251,6 +281,7 @@ class DataEngine(QObject):
         return None
 
     def shutdown(self) -> None:
+        self._stores_gen = -1  # helper threads stop at their next block
         with self._cv:
             self._quit = True
             self._slots.clear()
@@ -365,137 +396,136 @@ class DataEngine(QObject):
         self._bg = self._load(gen)
 
     def _load(self, gen: int):
-        """Background loader (generator: one step per next())."""
+        """Background loader (generator: one short step per next())."""
         src = self._source
         stores = self._stores
-        total = sum(s.info.length * _itemsize(s.info) for s in stores) or 1
-        done_bytes = 0
-        last_emit = 0.0
-        t_start = time.perf_counter()
+        prog = _Progress(self, gen, sum(s.info.length * _itemsize(s.info) for s in stores))
         mixed = src.has_mixed_layout()
-        # Channels read by npTDMS in a mixed (interleaved/DAQmx) file: one pass.
+        # npTDMS channels of an interleaved/DAQmx file: one data_chunks() pass.
         chunk_pass = [s for s in stores if mixed and s.fast is None and s.info.length]
         chunk_ids = {s.info.id for s in chunk_pass}
-        todo = [s for s in stores if s.info.id not in chunk_ids]
         builds: list = []
-
-        def emit_progress(text):
-            nonlocal last_emit
-            now = time.perf_counter()
-            if now - last_emit > 0.1:
-                last_emit = now
-                self.progress.emit(gen, min(0.999, done_bytes / total), text)
-
-        while todo:
-            prio = [c for c in self._priority if 0 <= c < len(stores)]
-            pick = None
-            for c in prio:
-                if stores[c] in todo:
-                    pick = stores[c]
-                    break
-            st = pick or todo[0]
-            todo.remove(st)
-            info = st.info
-            n = info.length
-            if n == 0:
+        remaining = dict.fromkeys(s.info.id for s in stores if s.info.id not in chunk_ids)
+        while remaining:
+            pick = next((c for c in self._priority if c in remaining), None)
+            if pick is None:
+                pick = next(iter(remaining))
+            del remaining[pick]
+            st = stores[pick]
+            before = prog.done
+            try:
+                yield from self._load_channel(gen, src, st, builds, prog)
+            except Exception as exc:  # one bad channel must not stop the others
                 st.done = True
-                continue
-            if info.kind == KIND_TIME and st.t0 is None:
-                first = src.read(info.id, 0, min(n, 1024))
-                ok = first[~np.isnat(first)]
-                st.t0 = ok[0].astype("datetime64[us]") if ok.size else np.datetime64(0, "us")
-            plottable = info.plottable
-            label = info.label
-            if st.to_ram:
-                arr = np.empty(n, dtype=info.dtype)
-                for i in range(0, n, BLOCK):
-                    if gen != self._stores_gen:
-                        return
-                    src.read_into(info.id, arr[i:min(n, i + BLOCK)], i)
-                    done_bytes += min(BLOCK, n - i) * _itemsize(info)
-                    emit_progress(f"Loading {label}")
-                    yield
-                st.ram = arr
-                if plottable and n >= PYR_MIN_LEN:
-                    # Build the pyramid on a helper thread; read the next channel now.
-                    st.pyr = pyr.Pyramid(n, st.base)
-                    builds.append(self._pool.submit(self._build_pyramid, gen, st, arr))
-                else:
-                    st.done = True
-                    self.channelsUpdated.emit(gen, [info.id])
-                yield
-                continue
-            p = pyr.Pyramid(n, st.base) if plottable and n >= PYR_MIN_LEN else None
-            st.pyr = p
-            if p is not None and st.fast is not None:
-                # Fast reads are thread-safe: stream on a helper thread.
-                builds.append(self._pool.submit(self._stream_pyramid, gen, st))
-                done_bytes += n * _itemsize(info)
-                yield
-                continue
-            for i in range(0, n, BLOCK):
-                if gen != self._stores_gen:
-                    return
-                a = src.read(info.id, i, min(n, i + BLOCK))
-                if p is not None:
-                    p.append(to_f64(a, info.kind, st.t0))
-                done_bytes += a.size * _itemsize(info)
-                emit_progress(f"Loading {label}")
-                yield
-            st.done = True
-            self.channelsUpdated.emit(gen, [info.id])
+                self.message.emit(gen, f"{st.info.label}: cannot read ({type(exc).__name__}: {exc})")
+            if gen != self._stores_gen:
+                return
+            prog.done = before + st.info.length * _itemsize(st.info)
             yield
-
         if chunk_pass:
-            arrays = {}
+            try:
+                yield from self._load_chunk_pass(gen, src, stores, chunk_pass, prog)
+            except Exception as exc:
+                self.message.emit(gen, f"Reading interleaved data failed: {type(exc).__name__}: {exc}")
             for st in chunk_pass:
-                info = st.info
-                arrays[info.id] = np.empty(info.length, dtype=info.dtype) if st.to_ram else None
-                if info.plottable and info.length >= PYR_MIN_LEN:
-                    st.pyr = pyr.Pyramid(info.length, st.base)
-            last_upd = time.perf_counter()
-            for cid, off, a in src.data_chunks():
-                if gen != self._stores_gen:
-                    return
-                st = stores[cid]
-                if cid not in chunk_ids:
-                    continue
-                info = st.info
-                if info.kind == KIND_TIME and st.t0 is None:
-                    ok = a[~np.isnat(a)]
-                    st.t0 = ok[0].astype("datetime64[us]") if ok.size else np.datetime64(0, "us")
-                arr = arrays[cid]
-                if arr is not None:
-                    arr[off:off + a.size] = a
-                if st.pyr is not None:
-                    st.pyr.append(to_f64(a, info.kind, st.t0))
-                done_bytes += a.size * _itemsize(info)
-                emit_progress("Loading (interleaved data)")
-                now = time.perf_counter()
-                if now - last_upd > 0.5:
-                    last_upd = now
-                    self.channelsUpdated.emit(gen, sorted(chunk_ids))
-                yield
-            for st in chunk_pass:
-                if arrays[st.info.id] is not None:
-                    st.ram = arrays[st.info.id]
                 st.done = True
             self.channelsUpdated.emit(gen, sorted(chunk_ids))
-
         while builds:
             if gen != self._stores_gen:
                 return
-            _done, rest = futures.wait(builds, timeout=0.02)
-            for f in _done:
+            finished, rest = futures.wait(builds, timeout=0.02)
+            for f in finished:
                 if f.exception() is not None:
-                    self.message.emit(gen, f"Pyramid build failed: {f.exception()}")
+                    self.message.emit(gen, f"Overview build failed: {f.exception()}")
             builds = list(rest)
-            emit_progress("Building overview")
+            prog.step("Building overview")
             yield
         for w in src.drain_warnings():
             self.message.emit(gen, w)
-        dt = time.perf_counter() - t_start
-        self.progress.emit(gen, 1.0, f"Loaded {total / 1e6:.1f} MB in {dt:.2f} s")
+        self.progress.emit(gen, 1.0, f"Loaded {prog.total / 1e6:.1f} MB in {prog.elapsed():.2f} s")
+
+    def _load_channel(self, gen: int, src: TdmsSource, st: _Store, builds: list, prog):
+        """Load one channel: RAM copy and/or pyramid (generator)."""
+        info = st.info
+        n = info.length
+        if n == 0:
+            st.done = True
+            return
+        if info.kind == KIND_TIME and st.t0 is None:
+            st.t0 = _first_time(src.read(info.id, 0, min(n, 1024)))
+        want_pyr = info.plottable and n >= PYR_MIN_LEN
+        label = f"Loading {info.label}"
+        if st.to_ram:
+            arr = np.empty(n, dtype=info.dtype)
+            for i in range(0, n, BLOCK):
+                if gen != self._stores_gen:
+                    return
+                k = min(BLOCK, n - i)
+                src.read_into(info.id, arr[i:i + k], i)
+                prog.add(k * _itemsize(info), label)
+                yield
+            st.ram = arr
+            if want_pyr:
+                # Pyramid on a helper thread; the worker reads the next channel.
+                st.pyr = pyr.Pyramid(n, st.base)
+                builds.append(self._pool.submit(self._build_pyramid, gen, st, arr))
+            else:
+                st.done = True
+                self.channelsUpdated.emit(gen, [info.id])
+            return
+        p = pyr.Pyramid(n, st.base) if want_pyr else None
+        st.pyr = p
+        if p is not None and st.fast is not None:
+            # Fast reads are thread-safe: stream on a helper thread.
+            builds.append(self._pool.submit(self._stream_pyramid, gen, st))
+            return
+        if p is None:
+            st.done = True  # read on demand only (strings, short channels)
+            self.channelsUpdated.emit(gen, [info.id])
+            return
+        for i in range(0, n, BLOCK):
+            if gen != self._stores_gen:
+                return
+            a = src.read(info.id, i, min(n, i + BLOCK))
+            p.append(to_f64(a, info.kind, st.t0))
+            prog.add(a.size * _itemsize(info), label)
+            yield
+        st.done = True
+        self.channelsUpdated.emit(gen, [info.id])
+
+    def _load_chunk_pass(self, gen: int, src: TdmsSource, stores, chunk_pass, prog):
+        """Load all npTDMS channels of an interleaved/DAQmx file in one pass."""
+        arrays = {}
+        ids = sorted(st.info.id for st in chunk_pass)
+        for st in chunk_pass:
+            info = st.info
+            arrays[info.id] = np.empty(info.length, dtype=info.dtype) if st.to_ram else None
+            if info.plottable and info.length >= PYR_MIN_LEN:
+                st.pyr = pyr.Pyramid(info.length, st.base)
+        last_upd = time.perf_counter()
+        for cid, off, a in src.data_chunks():
+            if gen != self._stores_gen:
+                return
+            st = stores[cid]
+            if cid not in arrays:
+                continue
+            info = st.info
+            if info.kind == KIND_TIME and st.t0 is None:
+                st.t0 = _first_time(a)
+            arr = arrays[cid]
+            if arr is not None:
+                arr[off:off + a.size] = a
+            if st.pyr is not None:
+                st.pyr.append(to_f64(a, info.kind, st.t0))
+            prog.add(a.size * _itemsize(info), "Loading (interleaved data)")
+            now = time.perf_counter()
+            if now - last_upd > 0.5:
+                last_upd = now
+                self.channelsUpdated.emit(gen, ids)
+            yield
+        for st in chunk_pass:
+            if arrays[st.info.id] is not None:
+                st.ram = arrays[st.info.id]
 
     def _build_pyramid(self, gen: int, st: _Store, arr: np.ndarray) -> None:
         """Helper thread: pyramid of a finished RAM array."""
@@ -532,9 +562,7 @@ class DataEngine(QObject):
 
     def _read_f64(self, st: _Store, i0: int, i1: int) -> np.ndarray:
         if st.info.kind == KIND_TIME and st.t0 is None:
-            first = self._read(st, 0, min(st.info.length, 1024))
-            ok = first[~np.isnat(first)]
-            st.t0 = ok[0].astype("datetime64[us]") if ok.size else np.datetime64(0, "us")
+            st.t0 = _first_time(self._read(st, 0, min(st.info.length, 1024)))
         return to_f64(self._read(st, i0, i1), st.info.kind, st.t0)
 
     def _can_read_cheap(self, st: _Store, n: int) -> bool:
