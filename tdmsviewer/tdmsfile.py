@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import logging
 import os
+import struct
 from dataclasses import dataclass, field
 
 import numpy as np
 from nptdms import TdmsFile
 
 from . import fastread
+from .fastread import nptdms_read
 
 _log = logging.getLogger(__name__)
 
@@ -190,14 +192,22 @@ class TdmsSource:
         _capture.records.clear()
         self._fd = -1
         self._fh = None
-        self._file = TdmsFile.open(self.path)
-        index_used = bool(getattr(self._file._reader, "_index_file_path", None))
         size = os.path.getsize(self.path)
+        has_index = os.path.isfile(self.path + "_index")
+        try:
+            self._file = TdmsFile.open(self.path)
+        except Exception as exc:
+            if not has_index:
+                raise
+            # A damaged .tdms_index must not block a good data file.
+            self._open_without_index()
+            self.warnings.append(f"The .tdms_index file cannot be read ({type(exc).__name__}: {exc}). "
+                                 "It was ignored.")
+        index_used = bool(getattr(self._file._reader, "_index_file_path", None))
         if index_used and not self._index_matches(size):
-            # A stale .tdms_index gives wrong data. Read the data file alone.
+            # A stale or foreign .tdms_index gives wrong data. Read the data file alone.
             self._file.close()
-            self._fh = open(self.path, "rb")
-            self._file = TdmsFile.open(self._fh)
+            self._open_without_index()
             index_used = False
             self.warnings.append("The .tdms_index file does not match the data file. It was ignored.")
         try:
@@ -219,12 +229,46 @@ class TdmsSource:
         _capture.records.clear()
         self.model.warnings = list(self.warnings)
 
-    def _index_matches(self, size: int) -> bool:
+    def _open_without_index(self) -> None:
+        self._fh = open(self.path, "rb")  # a file object makes npTDMS skip the index
+        self._file = TdmsFile.open(self._fh)
+
+    def _index_matches(self, size: int, samples: int = 256) -> bool:
+        """True if the index segments agree with the data file lead-ins.
+
+        Checks the end of the last segment and the 28-byte lead-in of the
+        first, the last and up to `samples` spread segments.
+        """
         try:
             segs = self._file._reader._segments
-            return not segs or segs[-1].next_segment_pos == size
         except Exception:
             return True
+        if not segs:
+            return True
+        if segs[-1].next_segment_pos != size:
+            return False
+        n = len(segs)
+        picks = sorted({0, n - 1, *range(0, n, max(1, n // samples))})
+        try:
+            with open(self.path, "rb") as fh:
+                for i in picks:
+                    seg = segs[i]
+                    fh.seek(seg.position)
+                    lead = fh.read(28)
+                    if len(lead) < 28 or lead[:4] != b"TDSm":
+                        return False
+                    toc = struct.unpack("<l", lead[4:8])[0]
+                    if toc != seg.toc_mask:
+                        return False
+                    order = ">" if toc & (1 << 6) else "<"  # kTocBigEndian
+                    _ver, nxt, raw = struct.unpack(order + "lQQ", lead[8:28])
+                    if seg.position + 28 + raw != seg.data_position:
+                        return False
+                    if nxt != 0xFFFFFFFFFFFFFFFF and min(size, seg.position + 28 + nxt) != seg.next_segment_pos:
+                        return False
+        except (OSError, struct.error, AttributeError):
+            return False
+        return True
 
     def _build_model(self, size: int, index_used: bool) -> FileModel:
         groups: list[GroupInfo] = []
@@ -253,7 +297,7 @@ class TdmsSource:
                 fast = None
                 if self._fd >= 0 and length and info.kind in (KIND_FLOAT, KIND_INT, KIND_BOOL, KIND_COMPLEX):
                     try:
-                        fast = fastread.make_fast_reader(self._file, c, self._fd)
+                        fast = fastread.make_fast_reader(self._file, c, self._fd, nptdms_read)
                     except Exception as exc:  # any doubt -> npTDMS
                         _log.debug("fast path off for %s: %s", c.path, exc)
                         fast = None
@@ -293,7 +337,7 @@ class TdmsSource:
         fast = self._fast[cid]
         if fast is not None:
             return fast.read(start, stop)
-        a = np.asarray(self._channels[cid].read_data(start, stop - start))
+        a = np.asarray(nptdms_read(self._channels[cid], start, stop - start))
         if not a.dtype.isnative:
             a = a.astype(a.dtype.newbyteorder("="))
         return a

@@ -53,6 +53,13 @@ class _Part:
     chunk_stride: int
     item_stride: int
     dtype: np.dtype
+    rel: int = 0  # offset inside the segment data (layout signature only)
+
+    @property
+    def signature(self) -> tuple:
+        """Layout kind: parts with equal signature use the same address rule."""
+        return (self.npc if self.chunk_stride else -1, self.chunk_stride, self.item_stride,
+                self.dtype.str, self.rel)
 
 
 class FastChannelReader:
@@ -171,6 +178,18 @@ class FastChannelReader:
             v = ve
 
 
+def nptdms_read(channel, start: int, count: int):
+    """channel.read_data(start, count) with a work-around for truncated files.
+
+    npTDMS 1.11 raises ValueError ("could not broadcast") when a channel has
+    no values in the cut final chunk. Reading to the end works; slice it.
+    """
+    try:
+        return channel.read_data(start, count)
+    except ValueError:
+        return channel.read_data(start)[:count]
+
+
 def _segment_flag(seg, name: str) -> bool:
     return bool(seg.toc_mask & _toc[name])
 
@@ -214,7 +233,12 @@ def build_parts(tdms_file, channel) -> tuple[list[_Part], np.dtype]:
             continue
         if seg._have_daqmx_objects():
             raise FastPathError("DAQmx segment")
-        if any(o.data_type is None or o.data_type.size is None for o in data_objs):
+        unsized = any(o.data_type is None or o.data_type.size is None for o in data_objs)
+        override = seg.final_chunk_lengths_override
+        interleaved = _segment_flag(seg, "kTocInterleavedData") and seg._have_interleaved_data()
+        if unsized and (interleaved or override is not None):
+            # Contiguous segments may hold strings (their data_size is known);
+            # truncated or interleaved ones may not.
             raise FastPathError("segment has unsized data")
         if target.data_type is not dt:
             raise FastPathError("data type changes between segments")
@@ -222,9 +246,7 @@ def build_parts(tdms_file, channel) -> tuple[list[_Part], np.dtype]:
         sdt = base_dtype.newbyteorder(order)
         npc = target.number_values
         chunk_size = seg._get_chunk_size()
-        override = seg.final_chunk_lengths_override
         n_full = seg.num_chunks - (1 if override is not None else 0)
-        interleaved = _segment_flag(seg, "kTocInterleavedData") and seg._have_interleaved_data()
         if interleaved:
             if len({o.number_values for o in data_objs}) != 1:
                 raise FastPathError("interleaved counts differ")
@@ -236,7 +258,7 @@ def build_parts(tdms_file, channel) -> tuple[list[_Part], np.dtype]:
                 col += o.data_type.size
             count = npc * n_full + (override.get(path, 0) if override is not None else 0)
             if count:
-                parts.append(_Part(pos, count, seg.data_position + col, count, 0, row, sdt))
+                parts.append(_Part(pos, count, seg.data_position + col, count, 0, row, sdt, col))
                 pos += count
             continue
         off = 0
@@ -246,7 +268,7 @@ def build_parts(tdms_file, channel) -> tuple[list[_Part], np.dtype]:
             off += o.data_size
         if n_full > 0:
             count = npc * n_full
-            parts.append(_Part(pos, count, seg.data_position + off, npc, chunk_size, isz, sdt))
+            parts.append(_Part(pos, count, seg.data_position + off, npc, chunk_size, isz, sdt, off))
             pos += count
         if override is not None:
             nfinal = override.get(path, 0)
@@ -258,15 +280,19 @@ def build_parts(tdms_file, channel) -> tuple[list[_Part], np.dtype]:
                         break
                     off_final += o.data_type.size * override.get(o.path, 0)
                 base = seg.data_position + n_full * chunk_size + off_final
-                parts.append(_Part(pos, nfinal, base, nfinal, 0, isz, sdt))
+                parts.append(_Part(pos, nfinal, base, nfinal, 0, isz, sdt, base - seg.data_position))
                 pos += nfinal
     if pos != len(channel):
         raise FastPathError(f"value count {pos} differs from channel length {len(channel)}")
     return parts, base_dtype
 
 
-def _windows(length: int, parts: list[_Part]) -> list[tuple[int, int]]:
-    """Return sample windows for verification (head, tail, part joints)."""
+def _windows(length: int, parts: list[_Part], max_kinds: int = 256) -> list[tuple[int, int]]:
+    """Sample windows for verification.
+
+    Head, tail, middle, part joints, and the first and last part of every
+    layout kind (signature), so that one odd segment cannot pass unchecked.
+    """
     w = min(length, 1024)
     out = [(0, w), (length - w, length)]
     if len(parts) > 1:
@@ -275,17 +301,36 @@ def _windows(length: int, parts: list[_Part]) -> list[tuple[int, int]]:
             out.append((max(0, j - 512), min(length, j + 512)))
     mid = length // 2
     out.append((max(0, mid - 300), min(length, mid + 300)))
-    return out
+    first: dict = {}
+    last: dict = {}
+    for p in parts:
+        sig = p.signature
+        if sig not in first:
+            if len(first) >= max_kinds:
+                continue
+            first[sig] = p
+        last[sig] = p
+    for group in (first, last):
+        for p in group.values():
+            k = min(p.count, 64)
+            out.append((p.start, p.start + k))
+            out.append((p.start + p.count - k, p.start + p.count))
+    return sorted(set(out))
 
 
-def make_fast_reader(tdms_file, channel, fd: int) -> FastChannelReader:
-    """Build and verify a fast reader. Raises FastPathError on any doubt."""
+def make_fast_reader(tdms_file, channel, fd: int, ref_read=None) -> FastChannelReader:
+    """Build and verify a fast reader. Raises on any doubt (caller uses npTDMS).
+
+    ref_read(channel, start, count) gives the npTDMS reference values.
+    """
     parts, base_dtype = build_parts(tdms_file, channel)
     reader = FastChannelReader(fd, parts, len(channel), base_dtype)
     if reader.length == 0:
         return reader
+    if ref_read is None:
+        ref_read = nptdms_read
     for a, b in _windows(reader.length, parts):
-        ref = np.asarray(channel.read_data(a, b - a))
+        ref = np.asarray(ref_read(channel, a, b - a))
         got = reader.read(a, b)
         if ref.dtype != got.dtype or ref.shape != got.shape or ref.tobytes() != got.tobytes():
             raise FastPathError(f"verification failed at [{a}, {b})")

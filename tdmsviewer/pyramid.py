@@ -62,50 +62,105 @@ _SCRATCH = threading.local()
 _SCRATCH_ELEMS = 1 << 19  # 4 MB work buffer: stays in cache, no page faults
 
 
-def _rows_stats(body: np.ndarray):
-    """Per-row (count, min, max, mean, m2) of a 2-D float64 array."""
+def _scratch(n: int) -> np.ndarray:
+    """Thread-local work buffer of at least n elements (n <= _SCRATCH_ELEMS)."""
+    buf = getattr(_SCRATCH, "buf", None)
+    if buf is None:
+        buf = _SCRATCH.buf = np.empty(_SCRATCH_ELEMS)
+    return buf[:n]
+
+
+def _row_stats_nan(row: np.ndarray, ref: float):
+    """(count, sum of (x - ref), M2) of one row, NaN ignored, in bounded chunks."""
+    n = 0
+    s = 0.0
+    step = _SCRATCH_ELEMS
+    with np.errstate(invalid="ignore"):
+        for c in range(0, row.size, step):
+            d = np.subtract(row[c:c + step], ref, out=_scratch(min(step, row.size - c)))
+            ok = ~np.isnan(d)
+            n += int(ok.sum())
+            s += float(np.where(ok, d, 0.0).sum())
+        if n == 0:
+            return 0, math.nan, 0.0
+        mu = s / n
+        m2 = 0.0
+        for c in range(0, row.size, step):
+            d = np.subtract(row[c:c + step], ref, out=_scratch(min(step, row.size - c)))
+            d -= mu
+            m2 += float(np.where(np.isnan(d), 0.0, d * d).sum())
+    return n, mu, m2
+
+
+def _rows_stats(body: np.ndarray, ref: float):
+    with np.errstate(invalid="ignore", over="ignore"):  # Inf data: Inf - Inf
+        return _rows_stats_impl(body, ref)
+
+
+def _rows_stats_impl(body: np.ndarray, ref: float):
+    """Per-row (count, min, max, mean - ref, m2) of a 2-D float64 array.
+
+    Means are relative to `ref` (one value per channel). This keeps full
+    precision for a small signal on a large offset.
+    """
     rows, k = body.shape
     mins = np.fmin.reduce(body, axis=1)
     maxs = np.fmax.reduce(body, axis=1)
-    sums = np.add.reduce(body, axis=1)
-    means = sums / k
+    sums = np.empty(rows)
     m2 = np.empty(rows)
-    step = max(1, _SCRATCH_ELEMS // k)
-    buf = getattr(_SCRATCH, "buf", None)
-    if buf is None or buf.size < step * k:
-        buf = _SCRATCH.buf = np.empty(max(_SCRATCH_ELEMS, step * k))
-    for r in range(0, rows, step):
-        blk = body[r:r + step]
-        dev = buf[: blk.size].reshape(blk.shape)
-        np.subtract(blk, means[r:r + step, None], out=dev)
-        m2[r:r + step] = np.einsum("ij,ij->i", dev, dev)
+    if k <= _SCRATCH_ELEMS:
+        step = _SCRATCH_ELEMS // k
+        for r in range(0, rows, step):
+            blk = body[r:r + step]
+            d = _scratch(blk.size).reshape(blk.shape)
+            np.subtract(blk, ref, out=d)
+            sm = np.add.reduce(d, axis=1)
+            sums[r:r + step] = sm
+            np.subtract(d, (sm / k)[:, None], out=d)
+            m2[r:r + step] = np.einsum("ij,ij->i", d, d)
+    else:  # few very long rows (raw statistics): chunk the columns
+        for r in range(rows):
+            _, mu, m2[r] = _row_stats_nan(body[r], ref)
+            sums[r] = mu * k
+    means = sums / k
     counts = np.full(rows, float(k))
     bad = ~np.isfinite(sums)
     if bad.any():
         # NaN or Inf inside: recompute these rows without NaN.
-        rows = body[bad]
-        ok = ~np.isnan(rows)
-        c = ok.sum(axis=1).astype(np.float64)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            s = np.where(ok, rows, 0.0).sum(axis=1)
-            mu = s / c
-            d = np.where(ok, rows - mu[:, None], 0.0)
-            m2b = np.einsum("ij,ij->i", d, d)
-        counts[bad] = c
-        means[bad] = mu
-        m2[bad] = np.where(c > 0, m2b, 0.0)
+        for r in np.flatnonzero(bad):
+            c, mu, mm = _row_stats_nan(body[r], ref)
+            counts[r], means[r], m2[r] = c, mu, mm
     return counts, mins, maxs, means, m2
+
+
+def _first_finite(y: np.ndarray, default=0.0):
+    """First finite value of y: the reference for relative means."""
+    for c in range(0, y.size, 4096):
+        seg = y[c:c + 4096]
+        ok = np.flatnonzero(np.isfinite(seg))
+        if ok.size:
+            return float(seg[ok[0]])
+    return default
+
+
+def _raw_rel(y: np.ndarray, ref: float):
+    """(count, min, max, mean - ref, m2) of a 1-D array as 1-element arrays."""
+    if y.size == 0:
+        z = np.zeros(1)
+        return z, np.full(1, np.nan), np.full(1, np.nan), z.copy(), z.copy()
+    return _rows_stats(y.reshape(1, -1), ref)
 
 
 def raw_stats(y: np.ndarray) -> Stats:
     """Exact statistics of a 1-D float64 array (NaN ignored)."""
     if y.size == 0:
         return EMPTY
-    c, mn, mx, mu, m2 = _rows_stats(y.reshape(1, -1))
+    ref = _first_finite(y)
+    c, mn, mx, mu, m2 = _raw_rel(y, ref)
     n = int(c[0])
     if n == 0:
         return EMPTY
-    return Stats(n, float(mn[0]), float(mx[0]), float(mu[0]), float(m2[0]))
+    return Stats(n, float(mn[0]), float(mx[0]), ref + float(mu[0]), float(m2[0]))
 
 
 def merge_stats(parts: list[Stats]) -> Stats:
@@ -127,9 +182,10 @@ def _merge_arrays(n, mn, mx, mu, m2) -> Stats:
         return EMPTY
     n, mn, mx, mu, m2 = n[ok], mn[ok], mx[ok], mu[ok], m2[ok]
     total = float(n.sum())
-    mean = float((n * mu).sum() / total)
-    d = mu - mean
-    m2t = float(m2.sum() + (n * d * d).sum())
+    with np.errstate(invalid="ignore", over="ignore"):  # Inf data
+        mean = float((n * mu).sum() / total)
+        d = mu - mean
+        m2t = float(m2.sum() + (n * d * d).sum())
     return Stats(int(total), float(np.fmin.reduce(mn)), float(np.fmax.reduce(mx)), mean, m2t)
 
 
@@ -139,7 +195,7 @@ def _group_merge(n, mn, mx, mu, m2, g: int):
     n2 = n.reshape(k, g)
     tot = n2.sum(axis=1)
     mu0 = np.where(n2 > 0, mu.reshape(k, g), 0.0)
-    with np.errstate(invalid="ignore", divide="ignore"):
+    with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
         mean = (n2 * mu0).sum(axis=1) / tot
         d = np.where(n2 > 0, mu0 - mean[:, None], 0.0)
         m2g = m2.reshape(k, g).sum(axis=1) + (n2 * d * d).sum(axis=1)
@@ -192,8 +248,10 @@ def interleave(centers: np.ndarray, mins: np.ndarray, maxs: np.ndarray):
 
 
 def floor_pow2(v: float) -> int:
-    """Largest power of two <= v (v >= 1)."""
-    return 1 << max(0, int(math.floor(math.log2(max(1.0, v)))))
+    """Largest power of two <= v (1 for v < 2)."""
+    if not v >= 2:
+        return 1
+    return 1 << (int(v).bit_length() - 1)
 
 
 # -- pyramid ------------------------------------------------------------------
@@ -230,6 +288,7 @@ class Pyramid:
         self._appended = 0
         self.covered = 0  # samples covered by finished level-0 buckets
         self.complete = self.length == 0
+        self.ref = None  # bucket means are stored relative to this value
 
     @property
     def nbytes(self) -> int:
@@ -245,20 +304,25 @@ class Pyramid:
         self._appended += block.size - self._carry.size
         if self._appended > self.length:
             raise ValueError("more samples than channel length")
+        if self.ref is None:
+            self.ref = _first_finite(block, None)
+        ref = 0.0 if self.ref is None else self.ref  # all-NaN so far: ref unused
         base = self.base
         j0 = self.covered // base
         nfull = block.size // base
         tail = block[nfull * base:]
         lv = self._l0
         if nfull:
-            c, mn, mx, mu, m2 = _rows_stats(block[: nfull * base].reshape(nfull, base))
+            c, mn, mx, mu, m2 = _rows_stats(block[: nfull * base].reshape(nfull, base), ref)
             sl = slice(j0, j0 + nfull)
             lv.n[sl], lv.mn[sl], lv.mx[sl], lv.mu[sl], lv.m2[sl] = c, mn, mx, mu, m2
         if self._appended == self.length:
+            if self.ref is None:
+                self.ref = 0.0
             if tail.size:
-                s = raw_stats(tail)
+                c, mn, mx, mu, m2 = _raw_rel(tail, self.ref)
                 j = j0 + nfull
-                lv.n[j], lv.mn[j], lv.mx[j], lv.mu[j], lv.m2[j] = s.n, s.min, s.max, s.mean, s.m2
+                lv.n[j], lv.mn[j], lv.mx[j], lv.mu[j], lv.m2[j] = c[0], mn[0], mx[0], mu[0], m2[0]
             self._carry = np.empty(0)
             self.covered = self.length
             self._build_levels()
@@ -325,22 +389,21 @@ class Pyramid:
         b = (i1 // base) * base
         if b <= a:
             return raw_stats(read_raw(i0, i1))
-        parts = []
-        if a > i0:
-            parts.append(raw_stats(read_raw(i0, a)))
-        if i1 > b:
-            parts.append(raw_stats(read_raw(b, i1)))
+        ref = self.ref if self.ref is not None else 0.0
         pieces, levels = self._level_pieces(a // base, b // base)
-        ns, mns, mxs, mus, m2s = [], [], [], [], []
+        cols = [[], [], [], [], []]  # n, min, max, mean - ref, m2
         for lvl, p, q in pieces:
             lv = levels[lvl]
-            ns.append(lv.n[p:q]); mns.append(lv.mn[p:q]); mxs.append(lv.mx[p:q])
-            mus.append(lv.mu[p:q]); m2s.append(lv.m2[p:q])
-        for s in parts:
-            ns.append(np.array([float(s.n)])); mns.append(np.array([s.min])); mxs.append(np.array([s.max]))
-            mus.append(np.array([s.mean])); m2s.append(np.array([s.m2]))
-        return _merge_arrays(np.concatenate(ns), np.concatenate(mns), np.concatenate(mxs),
-                             np.concatenate(mus), np.concatenate(m2s))
+            for col, arr in zip(cols, (lv.n, lv.mn, lv.mx, lv.mu, lv.m2)):
+                col.append(arr[p:q])
+        for p, q in ((i0, a), (b, i1)):
+            if q > p:
+                for col, arr in zip(cols, _raw_rel(read_raw(p, q), ref)):
+                    col.append(arr)
+        st = _merge_arrays(*(np.concatenate(c) for c in cols))
+        if st.n == 0:
+            return st
+        return Stats(st.n, st.min, st.max, ref + st.mean, st.m2)
 
     def minmax(self, w0: int, w1: int, bucket: int, read_raw):
         """Envelope of [w0, w1) with aligned buckets of `bucket` samples.

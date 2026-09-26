@@ -66,34 +66,48 @@ _TYPE_CODES = {
     np.dtype("float32"): 9, np.dtype("float64"): 10, np.dtype("bool"): 0x21,
     np.dtype("complex64"): 0x08000C, np.dtype("complex128"): 0x10000D,
 }
-_TOC_META, _TOC_RAW, _TOC_NEWOBJ, _TOC_INTERLEAVED = 1 << 1, 1 << 3, 1 << 2, 1 << 5
+_TOC_META, _TOC_RAW, _TOC_NEWOBJ = 1 << 1, 1 << 3, 1 << 2
+_TOC_INTERLEAVED, _TOC_BIG_ENDIAN = 1 << 5, 1 << 6
 _EPOCH_1904 = np.datetime64("1904-01-01T00:00:00", "us")
 
 
-def _tdms_str(text: str) -> bytes:
-    b = text.encode("utf-8")
-    return struct.pack("<I", len(b)) + b
+def _tdms_path(*names: str) -> str:
+    return "/" + "/".join("'" + n.replace("'", "''") + "'" for n in names)
 
 
-def _tdms_props(props: dict) -> bytes:
-    out = [struct.pack("<I", len(props))]
-    for key, val in props.items():
-        out.append(_tdms_str(key))
-        if isinstance(val, str):
-            out.append(struct.pack("<I", 0x20) + _tdms_str(val))
-        elif isinstance(val, bool):
-            out.append(struct.pack("<IB", 0x21, int(val)))
-        elif isinstance(val, int):
-            out.append(struct.pack("<Ii", 3, val))
-        elif isinstance(val, float):
-            out.append(struct.pack("<Id", 10, val))
-        else:
-            raise TypeError(f"unsupported property {key}={val!r}")
-    return b"".join(out)
+class _Enc:
+    """Encoder for TDMS metadata values in one byte order."""
+
+    def __init__(self, big_endian: bool):
+        self.o = ">" if big_endian else "<"
+
+    def u32(self, v: int) -> bytes:
+        return struct.pack(self.o + "I", v)
+
+    def text(self, t: str) -> bytes:
+        b = t.encode("utf-8")
+        return self.u32(len(b)) + b
+
+    def props(self, props: dict) -> bytes:
+        out = [self.u32(len(props))]
+        for key, val in props.items():
+            out.append(self.text(key))
+            if isinstance(val, str):
+                out.append(self.u32(0x20) + self.text(val))
+            elif isinstance(val, bool):
+                out.append(self.u32(0x21) + struct.pack("B", int(val)))
+            elif isinstance(val, int):
+                out.append(self.u32(3) + struct.pack(self.o + "i", val))
+            elif isinstance(val, float):
+                out.append(self.u32(10) + struct.pack(self.o + "d", val))
+            else:
+                raise TypeError(f"unsupported property {key}={val!r}")
+        return b"".join(out)
 
 
-def _column_bytes(a: np.ndarray) -> np.ndarray:
-    """Return an (n, itemsize) uint8 view of little-endian TDMS values."""
+def _column_bytes(a: np.ndarray, big_endian: bool) -> np.ndarray:
+    """Return an (n, itemsize) uint8 view of TDMS values in the given byte order."""
+    o = ">" if big_endian else "<"
     if a.dtype.kind == "M":
         us = (a.astype("datetime64[us]") - _EPOCH_1904).astype(np.int64)
         sec = np.floor_divide(us, 1_000_000)
@@ -101,11 +115,14 @@ def _column_bytes(a: np.ndarray) -> np.ndarray:
         # rem * 2**64 / 1e6 plus a tiny margin, so npTDMS reads back the same us.
         frac = rem * np.uint64(18446744073709) + (rem * np.uint64(551616)) // np.uint64(10**6)
         frac = frac + np.uint64(1 << 16)
-        rec = np.empty(a.size, dtype=[("f", "<u8"), ("s", "<i8")])
+        if big_endian:
+            rec = np.empty(a.size, dtype=[("s", ">i8"), ("f", ">u8")])
+        else:
+            rec = np.empty(a.size, dtype=[("f", "<u8"), ("s", "<i8")])
         rec["f"], rec["s"] = frac, sec
         return rec.view(np.uint8).reshape(a.size, 16)
-    le = a.astype(a.dtype.newbyteorder("<"))
-    return le.view(np.uint8).reshape(a.size, a.dtype.itemsize)
+    out = a.astype(a.dtype.newbyteorder(o))
+    return out.view(np.uint8).reshape(a.size, a.dtype.itemsize)
 
 
 def _type_code(dtype: np.dtype) -> int:
@@ -114,34 +131,47 @@ def _type_code(dtype: np.dtype) -> int:
     return _TYPE_CODES[np.dtype(dtype).newbyteorder("=")]
 
 
-def write_interleaved(path, group, channels, rows_per_segment, file_props=None, group_props=None):
-    """Write interleaved TDMS segments (all channels have the same length).
+def write_raw(path, group, channels, rows_per_segment, interleaved=True, big_endian=False,
+              file_props=None, group_props=None):
+    """Write TDMS segments with a small raw writer (all channels same length).
 
-    channels: list of (name, data, props). Data may be numeric or
-    datetime64. Every segment has a new object list.
+    channels: list of (name, data, props); data is numeric or datetime64.
+    Each segment has a new object list and one chunk. Layout is
+    interleaved or contiguous, little or big endian.
     """
     n = len(channels[0][1])
     assert all(len(d) == n for _, d, _ in channels)
-    cols = [_column_bytes(np.asarray(d)) for _, d, _ in channels]
+    enc = _Enc(big_endian)
+    cols = [_column_bytes(np.asarray(d), big_endian) for _, d, _ in channels]
+    none = b"\xff\xff\xff\xff"
     with open(path, "wb") as fh:
         for k, a in enumerate(range(0, n, rows_per_segment)):
             b = min(n, a + rows_per_segment)
             meta = []
-            objs = 0
             if k == 0:
-                meta.append(_tdms_str("/") + b"\xff\xff\xff\xff" + _tdms_props(file_props or {}))
-                meta.append(_tdms_str(f"/'{group}'") + b"\xff\xff\xff\xff" + _tdms_props(group_props or {}))
-                objs += 2
+                meta.append(enc.text("/") + none + enc.props(file_props or {}))
+                meta.append(enc.text(_tdms_path(group)) + none + enc.props(group_props or {}))
             for (name, data, props), col in zip(channels, cols):
-                index = struct.pack("<IIIQ", 20, _type_code(np.asarray(data).dtype), 1, b - a)
-                meta.append(_tdms_str(f"/'{group}'/'{name}'") + index
-                            + _tdms_props(props if k == 0 else {}))
-                objs += 1
-            meta_bytes = struct.pack("<I", objs) + b"".join(meta)
-            raw = np.hstack([c[a:b] for c in cols]).tobytes()
-            toc = _TOC_META | _TOC_RAW | _TOC_NEWOBJ | _TOC_INTERLEAVED
-            lead = b"TDSm" + struct.pack("<IIQQ", toc, 4713, len(meta_bytes) + len(raw), len(meta_bytes))
+                index = (enc.u32(20) + enc.u32(_type_code(np.asarray(data).dtype)) + enc.u32(1)
+                         + struct.pack(enc.o + "Q", b - a))
+                meta.append(enc.text(_tdms_path(group, name)) + index + enc.props(props if k == 0 else {}))
+            meta_bytes = enc.u32(len(meta)) + b"".join(meta)
+            if interleaved:
+                raw = np.hstack([c[a:b] for c in cols]).tobytes()
+            else:
+                raw = b"".join(c[a:b].tobytes() for c in cols)
+            toc = _TOC_META | _TOC_RAW | _TOC_NEWOBJ
+            toc |= _TOC_INTERLEAVED if interleaved else 0
+            toc |= _TOC_BIG_ENDIAN if big_endian else 0
+            lead = (b"TDSm" + struct.pack("<I", toc)
+                    + struct.pack(enc.o + "IQQ", 4713, len(meta_bytes) + len(raw), len(meta_bytes)))
             fh.write(lead + meta_bytes + raw)
+
+
+def write_interleaved(path, group, channels, rows_per_segment, file_props=None, group_props=None):
+    """Write interleaved little-endian TDMS segments (see write_raw)."""
+    write_raw(path, group, channels, rows_per_segment, interleaved=True, big_endian=False,
+              file_props=file_props, group_props=group_props)
 
 
 # -- signal recording ----------------------------------------------------------

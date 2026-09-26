@@ -14,8 +14,7 @@ import pytest
 from nptdms import TdmsFile
 
 import tdms_builders as tb
-from tdms_builders import Obj, Prop, RawTime, TdmsBuilder, obj_path
-from tdmsviewer import tdmsfile
+from tdms_builders import Obj, Prop, TdmsBuilder, obj_path
 from tdmsviewer.tdmsfile import (KIND_BOOL, KIND_COMPLEX, KIND_EMPTY, KIND_FLOAT, KIND_INT, KIND_STRING,
                                  KIND_TIME, TdmsSource)
 
@@ -271,8 +270,8 @@ def test_metadata_only_segment(write_tdms, open_source, rng):
 def _truncated_mixed_types(rng) -> tuple[TdmsBuilder, int]:
     """Last segment cut inside the first object of the last chunk.
 
-    The later objects (scaled, timestamp, string-free) have no values in
-    the last chunk, so they are read by npTDMS.
+    The later objects (timestamp, scaled i16) have no values in the last
+    chunk. They do not use the fast path, so npTDMS reads them.
     """
     b = TdmsBuilder()
     names = [("value", "f8"), ("stamp", "time"), ("scaled", "i2")]
@@ -418,18 +417,22 @@ def test_index_longer_than_data_file(write_tdms, open_source, rng):
 
 
 def test_index_of_same_size_but_other_layout(tmp_path, open_source, rng):
-    """An index of another file with the same size must not give wrong data."""
+    """An index of another file with the same size must not give wrong data.
+
+    Data file: 2 segments of 100 values. Index: 1 segment of 200 values,
+    padded (string property) to the same total file size.
+    """
     p = obj_path("G", "x")
-    a = TdmsBuilder()
-    a.segment(tb.header_objects(["G"]) + [Obj(p, tb.random_values("f8", 200, rng), props={"tag": "AAAA"})])
     b = TdmsBuilder()
     b.segment(tb.header_objects(["G"]) + [Obj(p, tb.random_values("f8", 100, rng), props={"tag": "B"})])
     b.raw_segment({p: tb.random_values("f8", 100, rng)})
-    # Pad file A's property so that both files have the same size.
-    diff = b.size - a.size
-    assert diff > 0
-    a = TdmsBuilder()
-    a.segment(tb.header_objects(["G"]) + [Obj(p, tb.random_values("f8", 200, rng), props={"tag": "A" * (4 + diff)})])
+
+    def other(tag):
+        a = TdmsBuilder()
+        a.segment(tb.header_objects(["G"]) + [Obj(p, tb.random_values("f8", 200, rng), props={"tag": tag})])
+        return a
+
+    a = other("A" * (b.size - other("").size))
     assert a.size == b.size
     path = str(tmp_path / "same_size.tdms")
     b.write(path)
@@ -491,39 +494,46 @@ def test_data_chunks_rebuild_channels(name, scenario, open_source):
 
 # -- open / close -------------------------------------------------------------------------------
 
-def _open_fds() -> int:
-    return len(os.listdir("/proc/self/fd"))
+def _fds_on(path) -> int:
+    """Number of open file descriptors of this process on `path` (or its index)."""
+    targets = {os.path.realpath(path), os.path.realpath(str(path) + "_index")}
+    n = 0
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            if os.path.realpath(os.readlink(f"/proc/self/fd/{fd}")) in targets:
+                n += 1
+        except OSError:
+            pass
+    return n
 
 
 def test_close_releases_files(scenario):
-    path, builder, notes = scenario("contiguous")
+    path, builder, notes = scenario("contiguous", index=True)
     gc.collect()
-    before = _open_fds()
+    assert _fds_on(path) == 0
     src = TdmsSource(path)
-    assert _open_fds() > before
+    assert _fds_on(path) >= 1
     src.close()
     src.close()  # twice is fine
-    assert _open_fds() == before
+    assert _fds_on(path) == 0
 
 
 def test_close_after_stale_index(write_tdms, rng):
     path = write_tdms(_three_segments(rng), index=2)
     gc.collect()
-    before = _open_fds()
     src = TdmsSource(path)
+    assert src.model.index_used is False
     src.close()
-    assert _open_fds() == before
+    assert _fds_on(path) == 0
 
 
 def test_not_a_tdms_file(tmp_path):
     p = tmp_path / "bad.tdms"
     p.write_bytes(b"this is not a TDMS file at all" * 10)
-    gc.collect()
-    before = _open_fds()
     with pytest.raises(Exception):
         TdmsSource(str(p))
     gc.collect()  # npTDMS keeps its file open until the failed TdmsFile is collected
-    assert _open_fds() == before
+    assert _fds_on(p) == 0
 
 
 def test_source_does_not_modify_file(scenario, tmp_path):
@@ -551,3 +561,51 @@ def test_relative_path(scenario, open_source, monkeypatch):
     monkeypatch.chdir(os.path.dirname(path))
     src = open_source(os.path.basename(path))
     assert src.model.path == path and os.path.isabs(src.path)
+
+
+# -- files written by nptdms.TdmsWriter --------------------------------------------------------
+
+def _writer_segments(rng):
+    from nptdms import ChannelObject, GroupObject, RootObject
+
+    x, y = tb.random_values("f8", 50, rng), tb.random_values("i4", 50, rng)
+    x2, y2 = tb.random_values("f8", 30, rng), tb.random_values("i4", 30, rng)
+    props = {"unit_string": "V", "gain": 2.5, "count": 7, "ok": True}
+    ours = TdmsBuilder(version=4712)
+    ours.segment([Obj("/", props={"title": "writer test"}), Obj(obj_path("G"), props={"flag": False}),
+                  Obj(obj_path("G", "x"), x, props=props), Obj(obj_path("G", "y"), y)])
+    ours.segment([Obj(obj_path("G", "x"), x2), Obj(obj_path("G", "y"), y2)])
+    theirs = [[RootObject({"title": "writer test"}), GroupObject("G", {"flag": False}),
+               ChannelObject("G", "x", x, props), ChannelObject("G", "y", y)],
+              [ChannelObject("G", "x", x2), ChannelObject("G", "y", y2)]]
+    return ours, theirs
+
+
+def test_builder_matches_nptdms_writer(tmp_path, rng):
+    """Self check of the raw builder: same bytes as nptdms.TdmsWriter (data and index)."""
+    ours, theirs = _writer_segments(rng)
+    path = tb.write_nptdms(tmp_path / "writer.tdms", theirs, index_file=True)
+    assert open(path, "rb").read() == ours.data_bytes()
+    assert open(path + "_index", "rb").read() == ours.index_bytes()
+
+
+def test_nptdms_writer_file(tmp_path, open_source, rng):
+    from nptdms import ChannelObject, GroupObject, RootObject
+
+    t = tb.random_times(40, rng)
+    words = tb.random_strings(40, rng)
+    start = np.datetime64("2026-07-28T12:05:36.5", "us")
+    segs = [[RootObject({"started": start, "operator": "tests"}), GroupObject("Log"),
+             ChannelObject("Log", "time", t), ChannelObject("Log", "words", words),
+             ChannelObject("Log", "value", tb.random_values("f4", 40, rng),
+                           {"wf_start_time": start, "wf_increment": 0.5, "wf_start_offset": 0.0})],
+            [ChannelObject("Log", "value", tb.random_values("f4", 25, rng))]]
+    path = tb.write_nptdms(tmp_path / "log.tdms", segs, index_file=True)
+    src = open_source(path)
+    assert src.model.index_used and src.model.warnings == []
+    by_name = {c.name: c for c in src.model.channels}
+    assert by_name["time"].kind == KIND_TIME and by_name["words"].kind == KIND_STRING
+    assert by_name["value"].length == 65  # shares a segment with strings: may use npTDMS
+    assert by_name["value"].wf_start_time is not None and src.model.t_ref == by_name["value"].wf_start_time
+    assert src.model.properties["operator"] == "tests"
+    check_source_against_nptdms(src, tb.nptdms_full(path), rng)

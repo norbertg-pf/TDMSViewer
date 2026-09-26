@@ -341,6 +341,29 @@ def test_open_failed_missing_file(drv, tmp_path):
     assert drv.rec.of("opened") == []
 
 
+def test_open_failed_directory(drv, tmp_path):
+    gen = drv.eng.open(str(tmp_path))
+    g, msg = drv.wait("openFailed", lambda g, m: g == gen)
+    assert msg.split(":")[0] in ("IsADirectoryError", "PermissionError", "OSError")
+
+
+def test_file_without_channels(drv, tmp_path):
+    empty = tmp_path / "zero.tdms"
+    empty.write_bytes(b"")
+    gen, model = drv.open(empty)
+    assert model.channels == [] and model.groups == [] and model.n_segments == 0
+    meta = tmp_path / "meta.tdms"
+    from nptdms import GroupObject, RootObject, TdmsWriter
+
+    with TdmsWriter(str(meta)) as w:
+        w.write_segment([RootObject({"a": 1}), GroupObject("only group", {"b": "x"})])
+    gen2, model2 = drv.open(meta)
+    assert [g.name for g in model2.groups] == ["only group"] and model2.channels == []
+    assert model2.properties == {"a": 1} and model2.groups[0].properties == {"b": "x"}
+    assert drv.plot([], 0.0, 1.0, 100) == {}
+    assert drv.table([0], 0, 10) == {}
+
+
 # -- background load -------------------------------------------------------------
 
 def test_background_load_progress_and_updates(drv, main_file):
@@ -369,15 +392,21 @@ def test_background_load_progress_and_updates(drv, main_file):
 def test_priority_channel_loads_first(drv, main_file, monkeypatch):
     from tdmsviewer import tdmsfile
 
-    order = []
-    real_into = tdmsfile.TdmsSource.read_into
+    order = []  # channel ids in the order the loader reads them
 
-    def spy(self, cid, out, start):
-        if cid not in order:
-            order.append(cid)
-        return real_into(self, cid, out, start)
+    def spy(name):
+        real = getattr(tdmsfile.TdmsSource, name)
 
-    monkeypatch.setattr(tdmsfile.TdmsSource, "read_into", spy)
+        def wrapper(self, cid, *args):
+            if cid not in order:
+                order.append(cid)
+            return real(self, cid, *args)
+
+        return wrapper
+
+    for name in ("read", "read_into"):
+        if hasattr(tdmsfile.TdmsSource, name):
+            monkeypatch.setattr(tdmsfile.TdmsSource, name, spy(name))
     first = [main_file.ids["Misc/cplx"], main_file.ids["Time/Time"]]
     drv.eng.set_priority(first)
     gen, _ = drv.open(main_file.path)
@@ -613,7 +642,7 @@ def test_x_channel_xy_decimated(drv, main_file, monkeypatch):
         assert nan_equal(y, Y[idx])
         assert np.all(np.diff(idx) >= 0)
         n = e - s
-        b = -(-n // 1000)
+        b = -(-n // 1000)  # bucket: ceil(n / (XY_MAX_POINTS / 2)), min and max per bucket
         k = n // b
         assert x.size == 2 * k + (n - k * b) <= 2000 + b
         for j in range(k):
@@ -716,7 +745,7 @@ def test_stats_large_offset_small_noise(drv, main_file):
 
 def test_stats_other_kinds_and_maps(drv, main_file):
     gen, model = drv.open(main_file.path)
-    # Timestamps in seconds, complex as magnitude, bool as 0/1 (no pyramid: raw path).
+    # Timestamps in seconds, complex as magnitude, bool as 0/1 (flag is short: no pyramid, raw path).
     for label in ("Misc/stamp", "Misc/cplx", "Misc/flag"):
         cid = main_file.ids[label]
         n = model.channels[cid].length
@@ -1061,22 +1090,28 @@ def interleaved_file(tmp_path_factory):
     path.unlink(missing_ok=True)
 
 
-def _check_interleaved(drv, f):
-    ids = f.ids
+def _check_file(drv, f, labels=None):
+    """Plot, stats and table answers of every channel equal brute force."""
     xm = LinearMap(0.0, 1.0)
-    for label in ("IL/a", "IL/raw", "IL/ts", "IL/f32"):
-        cid = ids[label]
+    for label in labels or list(f.ids):
+        cid = f.ids[label]
         y = f.f64(label)
-        for ia, ib, px in ((0, N_IL - 1, 16), (0, N_IL - 1, 100), (0, N_IL - 1, 1000), (6_990.5, 7_020.5, 200),
-                           (1000, 29_000, 50)):
-            res = drv.plot([PlotItem(cid, xm, 0, N_IL)], ia, ib, px)[cid]
+        n = y.size
+        for ia, ib, px in ((0, n - 1, 16), (0, n - 1, 100), (0, n - 1, 1000), (n * 0.233 + 0.5, n * 0.234, 200),
+                           (n * 0.03, n * 0.97, 50)):
+            res = drv.plot([PlotItem(cid, xm, 0, n)], ia, ib, px)[cid]
             check_plot(res, y, xm, ia, ib, px)
-        out = drv.stats([PlotItem(cid, xm, 0, N_IL)], 3.5, N_IL - 7.5, [6_999.6])
-        check_stats(out[cid], y, f.data[label], xm, 3.5, N_IL - 7.5, 0, N_IL, [6_999.6])
-        i0, vals = drv.table([cid], 6_990, 7_010)[cid]
-        assert i0 == 6_990
-        np.testing.assert_array_equal(vals, f.data[label][6_990:7_010])
+        out = drv.stats([PlotItem(cid, xm, 0, n)], 3.5, n - 7.5, [n * 0.2333])
+        check_stats(out[cid], y, f.data[label], xm, 3.5, n - 7.5, 0, n, [n * 0.2333])
+        a = int(n * 0.23)
+        i0, vals = drv.table([cid], a, a + 40)[cid]
+        assert i0 == a
+        assert same_values(vals, f.data[label][a:a + 40])
     assert drv.rec.of("message") == []
+
+
+def _check_interleaved(drv, f):
+    _check_file(drv, f, ["IL/a", "IL/raw", "IL/ts", "IL/f32"])
 
 
 def test_interleaved_file_chunk_pass(drv, interleaved_file):
@@ -1114,9 +1149,141 @@ def test_interleaved_file_disk_mode(drv, interleaved_file, monkeypatch):
     _check_interleaved(drv, interleaved_file)
 
 
+@pytest.mark.parametrize("interleaved", [True, False], ids=["interleaved", "contiguous"])
+@pytest.mark.parametrize("big_endian", [False, True], ids=["little", "big"])
+def test_layouts_and_byte_order(drv, tmp_path, interleaved, big_endian):
+    from engine_helpers import write_raw
+
+    n = 12_007
+    rng = np.random.default_rng(21)
+    f64 = rng.standard_normal(n)
+    f64[[1, 6_000, n - 1]] = [30.0, -30.0, 31.0]
+    i16 = rng.integers(-3000, 3000, n).astype(np.int16)
+    u32 = rng.integers(0, 2**32, n, dtype=np.uint64).astype(np.uint32)
+    ts = (np.datetime64("2023-01-01T00:00:00", "us")
+          + np.cumsum(rng.integers(10, 900, n)).astype("timedelta64[us]"))
+    raw = rng.integers(-500, 500, n).astype(np.int32)
+    chans = [("f64 'q'/x", f64, {"wf_increment": 0.5}), ("i16", i16, {}), ("u32", u32, {}), ("ts", ts, {}),
+             ("scaled", raw, SCALE)]
+    group = "G 'x'"
+    path = tmp_path / "layout.tdms"
+    write_raw(path, group, chans, 5_000, interleaved=interleaved, big_endian=big_endian,
+              file_props={"a": 1.5}, group_props={"b": "c"})
+    ids, data = _read_back(path)
+    f = DataFile(path, ids, data)
+    gen, model = drv.open(path)
+    assert [c.label for c in model.channels] == [f"{group}/{c[0]}" for c in chans]
+    assert model.properties == {"a": 1.5} and model.groups[0].properties == {"b": "c"}
+    by = {c.name: c for c in model.channels}
+    assert by["f64 'q'/x"].fast and by["i16"].fast and by["u32"].fast
+    assert not by["ts"].fast and not by["scaled"].fast
+    np.testing.assert_array_equal(data[f"{group}/scaled"], raw * 0.5 - 3.0)
+    assert same_values(data[f"{group}/i16"], i16) and same_values(data[f"{group}/ts"], ts)
+    _check_file(drv, f)
+
+
+def test_channels_in_some_segments(drv, tmp_path):
+    """Channels that are missing from some segments or change order."""
+    rng = np.random.default_rng(4)
+    a = [rng.standard_normal(k) for k in (5000, 3000, 2000, 1000)]
+    b = [rng.integers(0, 100, k).astype(np.int64) for k in (5000, 7000)]
+    c = [rng.standard_normal(k).astype(np.float32) for k in (6000, 50)]
+    segs = [
+        [("G", "a", a[0], {"unit_string": "V"}), ("G", "b", b[0], {})],
+        [("G", "a", a[1], {})],
+        [("G", "b", b[1], {}), ("G", "a", a[2], {})],
+        [("H", "c", c[0], {})],
+        [("G", "a", a[3], {}), ("H", "c", c[1], {})],
+    ]
+    path = tmp_path / "some.tdms"
+    write_segments(path, segs)
+    ids, data = _read_back(path)
+    np.testing.assert_array_equal(data["G/a"], np.concatenate(a))
+    np.testing.assert_array_equal(data["G/b"], np.concatenate(b))
+    gen, model = drv.open(path)
+    assert model.n_segments == 5
+    assert [(ch.label, ch.length) for ch in model.channels] == [("G/a", 11_000), ("G/b", 12_000), ("H/c", 6_050)]
+    assert all(ch.fast for ch in model.channels)
+    _check_file(drv, DataFile(path, ids, data))
+
+
+@pytest.fixture
+def main_copy(main_file, tmp_path):
+    """A private copy of the main file (deleted after the test)."""
+    import shutil
+
+    path = tmp_path / "copy.tdms"
+    shutil.copyfile(main_file.path, path)
+    yield path
+    path.unlink(missing_ok=True)
+
+
+def test_file_truncated_after_open(drv, main_file, main_copy, monkeypatch, small_file):
+    """The file becomes shorter on disk: errors are reported, the worker keeps running."""
+    monkeypatch.setenv("TDMSVIEWER_RAM_MB", "0")  # all data read from disk on demand
+    path = main_copy
+    gen, model = drv.open(path)
+    cid = main_file.ids["Wave/sig"]
+    xm = LinearMap(X0, DX)
+    good = drv.plot([PlotItem(cid, xm, 0, N)], X0 + 10 * DX, X0 + 90 * DX, 500)[cid]
+    with open(path, "r+b") as fh:
+        fh.truncate(os.path.getsize(path) // 3)
+    n_msg = len(drv.rec.of("message"))
+    drv.eng.request_plot(PlotRequest(900, [PlotItem(cid, xm, 0, N)], X0 + 140_000 * DX, X0 + 140_100 * DX, 500))
+    drv.qtbot.waitUntil(lambda: len(drv.rec.of("message")) > n_msg
+                        or drv.rec.find("plotReady", lambda g, s, o: s == 900) is not None, timeout=10_000)
+    ans = drv.rec.find("plotReady", lambda g, s, o: s == 900)
+    assert ans is None or cid not in ans[2], "no data for samples beyond the end of the file"
+    assert drv.eng._thread.is_alive()
+    assert drv.eng.try_read(gen, cid, 140_000, 140_010) is None
+    # Data before the cut still reads; other files still open.
+    again = drv.plot([PlotItem(cid, xm, 0, N)], X0 + 10 * DX, X0 + 90 * DX, 500)[cid]
+    assert nan_equal(again[1], good[1])
+    drv.rec.events = [e for e in drv.rec.events if e[0] != "message"]  # expected read errors
+    gen2, m2 = drv.open(small_file.path)
+    assert drv.table([0], 0, 3)[0][0] == 0
+
+
+def test_table_and_stats_answered_after_read_error(drv, main_file, main_copy, monkeypatch):
+    """A read error in one channel: table and stats still answer (like plot does)."""
+    monkeypatch.setenv("TDMSVIEWER_RAM_MB", "0")
+    path = main_copy
+    gen, model = drv.open(path)
+    sig, i32 = main_file.ids["Wave/sig"], main_file.ids["Wave/i32"]
+    flag = main_file.ids["Misc/flag"]  # in a later segment: cut away below
+    xm = LinearMap(0.0, 1.0)
+    with open(path, "r+b") as fh:
+        fh.truncate(os.path.getsize(path) // 3)
+    requests = [
+        ("tableReady", lambda q: drv.eng.request_table(TableRequest(q, [sig, i32], 0, 10))),
+        ("tableReady", lambda q: drv.eng.request_table(TableRequest(q, [flag, i32], 0, 10))),
+        ("statsReady", lambda q: drv.eng.request_stats(
+            StatsRequest(q, [PlotItem(flag, xm, 0, N_FLAG), PlotItem(sig, xm, 0, N)], 0.0, 100.0))),
+    ]
+    got = []
+    for name, post in requests:
+        seq = drv.seq()
+        n_msg = len(drv.rec.of("message"))
+        post(seq)
+        drv.qtbot.waitUntil(lambda: drv.rec.find(name, lambda g, s, o: s == seq) is not None
+                            or len(drv.rec.of("message")) > n_msg, timeout=10_000)
+        drv.qtbot.wait(100)
+        a = drv.rec.find(name, lambda g, s, o: s == seq)
+        got.append(None if a is None else a[2])
+    msgs = [m for _, m in drv.rec.of("message")]
+    drv.rec.events = [e for e in drv.rec.events if e[0] != "message"]  # reported below
+    assert got[0] is not None and set(got[0]) == {sig, i32}
+    assert got[1] is not None, f"table request not answered after a read error; messages: {msgs}"
+    assert set(got[1]) == {i32}
+    np.testing.assert_array_equal(got[1][i32][1], main_file.data["Wave/i32"][:10])
+    assert got[2] is not None, f"stats request not answered after a read error; messages: {msgs}"
+    assert sig in got[2] and (flag not in got[2] or got[2][flag]["stats"] is None)
+    assert_stats(got[2][sig]["stats"], ref_stats(main_file.f64("Wave/sig")[0:101]))
+
+
 # -- RAM mode vs disk mode -------------------------------------------------------------
 
-def _query_suite(drv, f, model, amap):
+def _query_suite(drv, f, model, amap, export_dir):
     """Run a fixed list of requests; return all answers in order."""
     ids = f.ids
     out = []
@@ -1144,8 +1311,19 @@ def _query_suite(drv, f, model, amap):
         res = drv.plot([PlotItem(ids["Wave/sig"], amap, 0, N)], T[a], T[b], px)
         check_plot(res[ids["Wave/sig"]], f.f64("Wave/sig"), amap, T[a], T[b], px)
         out.append(("plot-x", a, b, px, res))
+    xy = ArrayMap(np.ascontiguousarray(f.data["Wave/XY"]), False)
+    for s, e in ((0, N), (1234, 99_999)):
+        res = drv.plot([PlotItem(ids["Wave/sig"], xy, s, e)], -1.0, 1.0, 300)
+        np.testing.assert_array_equal(res[ids["Wave/sig"]][0], f.data["Wave/XY"][s:e])
+        out.append(("plot-xy", s, e, res))
     for i0, i1 in ((0, 50), (49_990, 50_010), (N - 20, N + 20)):
         out.append(("table", i0, i1, drv.table(list(ids.values()), i0, i1)))
+    items = [PlotItem(ids[k], LinearMap(0.0, 1.0), 0, f.data[k].size)
+             for k in ("Wave/sig", "Wave/i32", "Misc/stamp", "Misc/text", "Misc/cplx", "Misc/flag")]
+    csv_path = export_dir / f"suite_{id(drv)}.csv"
+    msg = drv.export(csv_path, items, 20.0, 3020.0, ["h"] * 18)
+    assert msg.startswith("Exported 3001 rows")
+    out.append(("export", csv_path.read_text(encoding="utf-8")))
     return out
 
 
@@ -1167,22 +1345,27 @@ def _same(a, b):
     elif hasattr(a, "m2"):  # Stats: pyramid merge order may differ in the last bits
         assert (a.n, a.min, a.max) == (b.n, b.min, b.max) or (a.n == b.n == 0)
         if a.n:
-            assert math.isclose(a.mean, b.mean, rel_tol=1e-13, abs_tol=1e-300)
+            # Bucket sizes differ (256 vs 1024), so the summation order differs:
+            # allow rounding relative to the data scale, not to a near-zero mean.
+            scale = max(abs(a.min), abs(a.max), 1e-300)
+            assert math.isclose(a.mean, b.mean, rel_tol=1e-13, abs_tol=1e-14 * scale)
             assert math.isclose(a.m2, b.m2, rel_tol=1e-9, abs_tol=1e-300)
     elif isinstance(a, float) and math.isnan(a):
         assert math.isnan(b)
+    elif isinstance(a, str) and a.startswith("Exported "):
+        assert a.split(" to ")[0] == b.split(" to ")[0]
     else:
         assert a == b
 
 
-def test_ram_and_disk_mode_identical(new_driver, main_file, monkeypatch):
+def test_ram_and_disk_mode_identical(new_driver, main_file, monkeypatch, tmp_path):
     T = main_file.data["Time/Time"]
     amap = ArrayMap(np.ascontiguousarray(T, dtype=np.float64), True)
     ram = new_driver()
     gen, model = ram.open(main_file.path)
     assert all(st.ram is not None for st in ram.eng._stores if st.info.length)
     assert all(st.base == 256 for st in ram.eng._stores)
-    res_ram = _query_suite(ram, main_file, model, amap)
+    res_ram = _query_suite(ram, main_file, model, amap, tmp_path)
 
     # Disk mode: tiny RAM budget, small pyramid budget (larger base), small load blocks.
     monkeypatch.setenv("TDMSVIEWER_RAM_MB", "0.01")
@@ -1197,7 +1380,7 @@ def test_ram_and_disk_mode_identical(new_driver, main_file, monkeypatch):
         assert st.ram is None, label
         assert st.base == 1024, label
         assert st.pyr is not None and st.pyr.complete and st.pyr.base == 1024
-    res_disk = _query_suite(disk, main_file, model_d, amap)
+    res_disk = _query_suite(disk, main_file, model_d, amap, tmp_path)
     assert len(res_ram) == len(res_disk)
     for a, b in zip(res_ram, res_disk):
         _same(a, b)
@@ -1342,8 +1525,9 @@ def test_shutdown_during_load(qtbot, big_file, monkeypatch):
     assert time.perf_counter() - t < 3.0
     assert not eng._thread.is_alive()
     assert eng._source is None
-    # Pyramid helper threads stop at their next block.
-    helpers = list(getattr(eng, "_pool", None)._threads) if getattr(eng, "_pool", None) else []
+    # Pyramid helper threads (if any) stop at their next block.
+    pool = getattr(eng, "_pool", None)
+    helpers = list(pool._threads) if pool is not None else []
     qtbot.waitUntil(lambda: not any(h.is_alive() for h in helpers), timeout=5_000)
 
 
@@ -1356,9 +1540,13 @@ def test_shutdown_idle_engine(qtbot):
 # -- real FlexLogger file ----------------------------------------------------------------
 
 @pytest.mark.skipif(not REAL_FILE.exists(), reason="sample file not available")
-def test_real_flexlogger_file(drv, tmp_path):
+@pytest.mark.parametrize("ram_mb", ["2048", "0.5"], ids=["ram", "mixed"])
+def test_real_flexlogger_file(drv, tmp_path, monkeypatch, ram_mb):
+    monkeypatch.setenv("TDMSVIEWER_RAM_MB", ram_mb)  # 0.5 MB: one channel in RAM, 15 on disk
     ids, data = _read_back(REAL_FILE)
     gen, model = drv.open(REAL_FILE)
+    in_ram = sum(st.ram is not None for st in drv.eng._stores)
+    assert in_ram == (16 if ram_mb == "2048" else 1)
     assert [g.name for g in model.groups] == ["PXIe-4303 (PXI2Slot3)", "PXIe-4303 (PXI2Slot5)", "PXIe-6363", "Time"]
     assert len(model.channels) == 16
     assert all(c.length == 44_275 and c.kind == "float" and c.dtype == np.float64 for c in model.channels)

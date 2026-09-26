@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import math
+import time
 
 import numpy as np
 import pyqtgraph as pg
@@ -71,7 +72,9 @@ class ArrayMap:
         j = np.minimum(i + 1, n - 1)
         f = np.clip(idx - i, 0.0, 1.0)
         xi = self.x[i]
-        return xi + f * (self.x[j] - xi)
+        # At a whole index use X itself: 0 * (NaN or Inf neighbour) would give NaN.
+        with np.errstate(invalid="ignore"):
+            return np.where(f > 0, xi + f * (self.x[j] - xi), xi)
 
     def x_of(self, i: float) -> float:
         return float(self.index_to_x(np.array([i]))[0])
@@ -170,16 +173,50 @@ class TimeAxisItem(pg.AxisItem):
         if self.fmt == FMT_NUMBER:
             return super().tickValues(minVal, maxVal, size)
         out = []
+        seen: list[float] = []
         for spacing, offset in self.tickSpacing(minVal, maxVal, size):
-            start = math.ceil((minVal - offset) / spacing) * spacing + offset
-            n = int((maxVal - start) / spacing) + 1
-            if n > 2000 or n < 0:
-                continue
-            vals = [start + k * spacing for k in range(n)]
-            prev = [v for _, vs in out for v in vs]
-            vals = [v for v in vals if all(abs(v - p) > spacing * 1e-6 for p in prev)]
+            if self.fmt == FMT_ABSOLUTE and spacing >= 3600 and spacing % 3600 == 0:
+                vals = self._calendar_ticks(minVal, maxVal, spacing)
+            else:
+                start = math.ceil((minVal - offset) / spacing) * spacing + offset
+                n = int((maxVal - start) / spacing) + 1
+                if n > 2000 or n < 0:
+                    continue
+                vals = [start + k * spacing for k in range(n)]
+            tol = spacing * 1e-6
+            vals = [v for v in vals if all(abs(v - p) > tol for p in seen)]
+            seen.extend(vals)
             out.append((spacing, vals))
         return out
+
+    def _calendar_ticks(self, minVal: float, maxVal: float, spacing: float) -> list[float]:
+        """Ticks on local wall-clock hours/days (correct across daylight saving changes)."""
+        try:
+            first = _dt.datetime.fromtimestamp(self.t_ref + minVal)
+        except (OverflowError, OSError, ValueError):
+            return []
+        end = self.t_ref + maxVal
+        if spacing >= 86400:
+            days = int(spacing // 86400)
+            d = first.replace(hour=0, minute=0, second=0, microsecond=0)
+            d -= _dt.timedelta(days=d.toordinal() % days)
+            step = _dt.timedelta(days=days)
+        else:
+            hours = int(spacing // 3600)
+            d = first.replace(minute=0, second=0, microsecond=0, hour=first.hour - first.hour % hours)
+            step = _dt.timedelta(hours=hours)
+        vals = []
+        for _ in range(2000):
+            try:
+                ts = time.mktime(d.timetuple())
+            except (OverflowError, ValueError):
+                break
+            if ts > end:
+                break
+            if ts >= self.t_ref + minVal:
+                vals.append(ts - self.t_ref)
+            d += step
+        return vals
 
     def tickStrings(self, values, scale, spacing):
         if self.fmt == FMT_NUMBER:
@@ -188,9 +225,12 @@ class TimeAxisItem(pg.AxisItem):
         if self.fmt == FMT_RELATIVE:
             return [format_duration(v, dec) for v in values]
         out = []
+        scale = 10 ** dec
         for v in values:
             try:
-                t = _dt.datetime.fromtimestamp(self.t_ref + v)
+                # Round once in integer units so that x.9996 s carries into the seconds.
+                secs, frac = divmod(round((self.t_ref + v) * scale), scale)
+                t = _dt.datetime.fromtimestamp(secs)
             except (OverflowError, OSError, ValueError):
                 out.append("")
                 continue
@@ -199,6 +239,5 @@ class TimeAxisItem(pg.AxisItem):
             elif spacing >= 1:
                 out.append(t.strftime("%H:%M:%S"))
             else:
-                frac = f"{t.microsecond / 1e6:.{dec}f}"[1:] if dec else ""
-                out.append(t.strftime("%H:%M:%S") + frac)
+                out.append(t.strftime("%H:%M:%S") + (f".{frac:0{dec}d}" if dec else ""))
         return out

@@ -63,6 +63,7 @@ def opened():
 
 
 def check_reader(reader, ref, rng, joints=(), msg=""):
+    """Compare reader.read with npTDMS values for many windows (clamped like TdmsSource)."""
     n = len(ref)
     assert reader.length == n
     for a, b in tb.windows(n, rng, count=60, joints=joints):

@@ -455,11 +455,11 @@ class TdmsBuilder:
             size = len(encode_values(T_STRING, first, e))
             body = struct.pack(e + "IIQQ", code, 1, npc, size)
             st = _State(o.path, True, code, npc, size)
-            return st, struct.pack(e + "I", len(body)) + body
+            return st, struct.pack(e + "I", len(body) + 4) + body  # length includes this field
         body = struct.pack(e + "IIQ", code, 1, npc)
         size = npc * CODE_SIZE.get(code, 0)
         st = _State(o.path, True, code, npc, size)
-        return st, struct.pack(e + "I", len(body)) + body
+        return st, struct.pack(e + "I", len(body) + 4) + body  # length includes this field
 
     def _raw_data(self, objs: list[_State], vals: dict, chunks: int, interleaved: bool, e: str) -> bytes:
         if not objs:
@@ -546,6 +546,21 @@ def header_objects(groups=(), file_props: dict | None = None, group_props: dict 
     return objs
 
 
+def write_nptdms(path, segments, version: int = 4712, index_file: bool = False) -> str:
+    """Write a file with nptdms.TdmsWriter.
+
+    segments: list of segments, each a list of nptdms objects
+    (RootObject, GroupObject, ChannelObject).
+    """
+    from nptdms import TdmsWriter
+
+    path = os.fspath(path)
+    with TdmsWriter(path, version=version, index_file=index_file) as w:
+        for seg in segments:
+            w.write_segment(seg)
+    return path
+
+
 # -- comparison helpers ----------------------------------------------------------
 
 def windows(n: int, rng: np.random.Generator, count: int = 40, joints=()) -> list[tuple[int, int]]:
@@ -586,6 +601,7 @@ def same_values(got, ref) -> bool:
 
 
 def assert_same_values(got, ref, msg: str = "") -> None:
+    """Assert same shape, dtype and bytes (object arrays: same items)."""
     got_a = np.asarray(got)
     ref_a = np.asarray(ref)
     assert got_a.shape == ref_a.shape, f"{msg}: shape {got_a.shape} != {ref_a.shape}"
@@ -617,8 +633,10 @@ def nptdms_channel_data(tdms, group: str, name: str):
 
 
 # -- scenarios -------------------------------------------------------------------
-# Each scenario returns (builder, notes). notes["fast"] maps channel path to
-# the expected fast path flag (True/False); missing paths are not checked.
+# Each scenario returns (builder, notes).
+#   notes["fast"]: channel path -> expected fast path flag (missing paths are not checked)
+#   notes["exact"]: False if builder.expected() does not hold for the file
+#   notes["prefix"]: True if npTDMS values are a prefix of builder.expected() (truncated files)
 
 G = "Group"
 

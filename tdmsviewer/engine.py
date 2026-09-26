@@ -536,7 +536,8 @@ class DataEngine(QObject):
                 return
             p.append(to_f64(arr[i:i + BLOCK], info.kind, st.t0))
         st.done = True
-        self.channelsUpdated.emit(gen, [info.id])
+        if gen == self._stores_gen:
+            self.channelsUpdated.emit(gen, [info.id])
 
     def _stream_pyramid(self, gen: int, st: _Store) -> None:
         """Helper thread: pyramid of a disk channel via the fast reader."""
@@ -551,9 +552,16 @@ class DataEngine(QObject):
             st.fast.read_into(blk, i)
             p.append(to_f64(blk, info.kind, st.t0))
         st.done = True
-        self.channelsUpdated.emit(gen, [info.id])
+        if gen == self._stores_gen:
+            self.channelsUpdated.emit(gen, [info.id])
 
     # -- reading helpers (worker) ---------------------------------------------------
+
+    def _store(self, cid) -> _Store | None:
+        """Store of a channel id, or None for an unknown id (also negative ids)."""
+        if isinstance(cid, (int, np.integer)) and 0 <= cid < len(self._stores):
+            return self._stores[cid]
+        return None
 
     def _read(self, st: _Store, i0: int, i1: int) -> np.ndarray:
         if st.ram is not None:
@@ -580,7 +588,9 @@ class DataEngine(QObject):
                 if out:  # a newer view exists: deliver what is done
                     self.plotReady.emit(gen, req.seq, out)
                 return
-            st = self._stores[it.cid]
+            st = self._store(it.cid)
+            if st is None:
+                continue
             if not st.info.plottable:
                 continue
             try:
@@ -671,7 +681,10 @@ class DataEngine(QObject):
             i0 = max(0, req.i0)
             i1 = min(st.info.length, req.i1)
             if i1 > i0:
-                out[cid] = (i0, self._read(st, i0, i1))
+                try:
+                    out[cid] = (i0, self._read(st, i0, i1))
+                except Exception as exc:  # one bad channel must not drop the answer
+                    self.message.emit(gen, f"{st.info.label}: {exc}")
         self.tableReady.emit(gen, req.seq, out)
 
     # -- statistics -----------------------------------------------------------------
@@ -681,34 +694,40 @@ class DataEngine(QObject):
         for it in req.items:
             if self._pending("stats"):
                 return
-            st = self._stores[it.cid]
-            info = st.info
-            if not info.plottable:
+            st = self._store(it.cid)
+            if st is None or not st.info.plottable:
                 continue
-            s, e = it.s, min(it.e, info.length)
-            xmap = it.xmap
-            if isinstance(xmap, ArrayMap):
-                e = min(e, xmap.x.size)
-            i0, i1 = inner_range(xmap, req.xa, req.xb, s, e)
-            res = {"range": (i0, i1), "stats": None, "cursors": []}
-            n = i1 - i0
-            if n > 0:
-                p = st.pyr
-                if p is not None and p.covered >= i1:
-                    res["stats"] = p.stats(i0, i1, lambda a, z: self._read_f64(st, a, z))
-                elif self._can_read_cheap(st, n):
-                    res["stats"] = pyr.raw_stats(self._read_f64(st, i0, i1))
-            else:
-                res["stats"] = pyr.EMPTY
-            for cx in req.cursors:
-                k = xmap.nearest(cx, s, e)
-                if k < 0:
-                    res["cursors"].append(None)
-                else:
-                    v = self._read(st, k, k + 1)
-                    res["cursors"].append((k, float(xmap.x_of(k)), v[0] if v.size else None))
-            out[it.cid] = res
+            try:
+                out[it.cid] = self._stats_one(st, it, req)
+            except Exception as exc:  # one bad channel must not drop the answer
+                self.message.emit(gen, f"{st.info.label}: {exc}")
         self.statsReady.emit(gen, req.seq, out)
+
+    def _stats_one(self, st: _Store, it: PlotItem, req: StatsRequest) -> dict:
+        info = st.info
+        s, e = it.s, min(it.e, info.length)
+        xmap = it.xmap
+        if isinstance(xmap, ArrayMap):
+            e = min(e, xmap.x.size)
+        i0, i1 = inner_range(xmap, req.xa, req.xb, s, e)
+        res = {"range": (i0, i1), "stats": None, "cursors": []}
+        n = i1 - i0
+        if n > 0:
+            p = st.pyr
+            if p is not None and p.covered >= i1:
+                res["stats"] = p.stats(i0, i1, lambda a, z: self._read_f64(st, a, z))
+            elif self._can_read_cheap(st, n):
+                res["stats"] = pyr.raw_stats(self._read_f64(st, i0, i1))
+        else:
+            res["stats"] = pyr.EMPTY
+        for cx in req.cursors:
+            k = xmap.nearest(cx, s, e)
+            if k < 0:
+                res["cursors"].append(None)
+            else:
+                v = self._read(st, k, k + 1)
+                res["cursors"].append((k, float(xmap.x_of(k)), v[0] if v.size else None))
+        return res
 
     # -- x channel ------------------------------------------------------------------
 
@@ -738,12 +757,14 @@ class DataEngine(QObject):
     # -- export ---------------------------------------------------------------------
 
     def _do_export(self, gen: int, req: ExportRequest) -> None:
-        from .formatting import format_value
+        from .formatting import format_export
 
         try:
             ranges = []
             for it in req.items:
-                st = self._stores[it.cid]
+                st = self._store(it.cid)
+                if st is None:
+                    continue
                 e = min(it.e, st.info.length)
                 if isinstance(it.xmap, ArrayMap):
                     e = min(e, it.xmap.x.size)
@@ -768,7 +789,7 @@ class DataEngine(QObject):
                         cells = []
                         for idx, xs, vals in cols:
                             if k < idx.size:
-                                cells += [str(int(idx[k])), repr(float(xs[k])), _csv_cell(format_value(vals[k]))]
+                                cells += [str(int(idx[k])), repr(float(xs[k])), _csv_cell(format_export(vals[k]))]
                             else:
                                 cells += ["", "", ""]
                         lines.append(",".join(cells))
