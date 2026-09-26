@@ -646,27 +646,29 @@ def test_unknown_channel_ids_are_skipped(drv, main_file):
     """Plot and statistics requests skip unknown channel ids, like table requests do."""
     gen, model = drv.open(main_file.path)
     ok = main_file.ids["Wave/i32"]
+    bad = len(model.channels)
     xm = LinearMap(0.0, 1.0)
-    items = [PlotItem(ok, xm, 0, N), PlotItem(len(model.channels), xm, 0, N), PlotItem(-1, xm, 0, N)]
-    eng = drv.eng
-    eng.request_plot(PlotRequest(501, items, 0.0, 100.0, 100))
-    eng.request_stats(StatsRequest(502, items, 0.0, 100.0))
-    eng.request_table(TableRequest(503, [ok, len(model.channels), -1], 0, 10))
-    got = {}
-
-    def answered():
-        for name, seq in (("plotReady", 501), ("statsReady", 502), ("tableReady", 503)):
-            a = drv.rec.find(name, lambda g, s, o, _q=seq: g == gen and s == _q)
-            if a is not None:
-                got[name] = a[2]
-        return len(got) == 3 or bool(drv.rec.errors())
-
-    drv.qtbot.waitUntil(answered, timeout=10_000)
-    errors = [m for _, m in drv.rec.errors()]
+    items = [PlotItem(ok, xm, 0, N), PlotItem(bad, xm, 0, N), PlotItem(-1, xm, 0, N)]
+    posts = [("tableReady", lambda q: drv.eng.request_table(TableRequest(q, [ok, bad, -1], 0, 10))),
+             ("plotReady", lambda q: drv.eng.request_plot(PlotRequest(q, items, 0.0, 100.0, 100))),
+             ("statsReady", lambda q: drv.eng.request_stats(StatsRequest(q, items, 0.0, 100.0)))]
+    got, errors = {}, []
+    for name, post in posts:  # one at a time: an answer or an engine error
+        seq = drv.seq()
+        n_err = len(drv.rec.errors())
+        post(seq)
+        drv.qtbot.waitUntil(lambda: drv.rec.find(name, lambda g, s, o: g == gen and s == seq) is not None
+                            or len(drv.rec.errors()) > n_err, timeout=10_000)
+        a = drv.rec.find(name, lambda g, s, o: g == gen and s == seq)
+        if a is None:
+            errors.append((name, drv.rec.errors()[-1][1]))
+        else:
+            got[name] = a[2]
+    # Keep the fixture teardown quiet: this test reports the errors itself.
     drv.rec.events = [e for e in drv.rec.events if not (e[0] == "message" and "Internal error" in e[1][1])]
-    assert set(got.get("tableReady", {})) == {ok}
-    assert errors == [], f"engine error for an unknown channel id: {errors}"
-    assert set(got["plotReady"]) == {ok}, "unknown ids must not be answered (cid -1 must not map to the last channel)"
+    assert set(got["tableReady"]) == {ok}
+    assert errors == [], f"no answer, engine error for an unknown channel id: {errors}"
+    assert set(got["plotReady"]) == {ok}, "cid -1 must not map to the last channel"
     assert set(got["statsReady"]) == {ok}
 
 
