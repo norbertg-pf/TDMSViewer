@@ -227,6 +227,7 @@ class PlotPanel(QWidget):
         super().__init__(parent)
         pg.setConfigOptions(antialias=False, background=theme.PLOT_BG, foreground=theme.PLOT_FG)
         self._curves: dict[int, pg.PlotDataItem] = {}
+        self._inf_marks: dict[int, pg.ScatterPlotItem] = {}
         self._entries: dict[int, LegendEntry] = {}
         self._history: list = []
         self._last_push = 0.0
@@ -365,6 +366,9 @@ class PlotPanel(QWidget):
         for c in self._curves.values():
             self.vb.removeItem(c)
         self._curves.clear()
+        for m in self._inf_marks.values():
+            self.vb.removeItem(m)
+        self._inf_marks.clear()
         self._entries = {e.cid: e for e in entries}
         self.legend.blockSignals(True)
         self.legend.clear()
@@ -389,6 +393,10 @@ class PlotPanel(QWidget):
         curve = self._curves.get(cid)
         if curve is None:
             return
+        if y.size and np.isinf(y).any():
+            y = self._clamp_inf(cid, x, y)
+        elif cid in self._inf_marks:
+            self._inf_marks[cid].setData([], [])
         sparse = False
         if x.size >= 1:
             (x0, x1), w = self.vb.viewRange()[0], max(1.0, self.vb.width())
@@ -402,6 +410,30 @@ class PlotPanel(QWidget):
                           symbolPen=pg.mkPen(e.color), symbolBrush=pg.mkBrush(e.color))
         else:
             curve.setData(x, y, connect="finite", symbol=None)
+
+    def _clamp_inf(self, cid: int, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        """Draw +/-Inf samples at the edge of the finite data, with red triangles.
+
+        pyqtgraph cannot draw Inf; without this an Inf spike would be invisible.
+        """
+        fin = y[np.isfinite(y)]
+        lo, hi = (float(fin.min()), float(fin.max())) if fin.size else (0.0, 1.0)
+        pad = 0.08 * (hi - lo) or 0.08 * max(abs(hi), 1.0)
+        pos, neg = y == np.inf, y == -np.inf
+        y = y.copy()
+        y[pos] = hi + pad
+        y[neg] = lo - pad
+        marks = self._inf_marks.get(cid)
+        if marks is None:
+            marks = pg.ScatterPlotItem(size=11, pen=pg.mkPen("#b00020"), brush=pg.mkBrush("#ff4d6d"))
+            marks.setZValue(900)
+            marks.setToolTip("Inf sample (drawn at the edge of the finite data)")
+            self.vb.addItem(marks)
+            self._inf_marks[cid] = marks
+        sel = pos | neg
+        marks.setData(x[sel], y[sel], symbol=np.where(pos[sel], "t1", "t").tolist())
+        marks.setVisible(self._curves[cid].isVisible())
+        return y
 
     def clear_data(self) -> None:
         for c in self._curves.values():
@@ -570,6 +602,8 @@ class PlotPanel(QWidget):
         curve = self._curves.get(cid)
         if curve is not None:
             curve.setVisible(item.checkState() == Qt.Checked)
+            if cid in self._inf_marks:
+                self._inf_marks[cid].setVisible(curve.isVisible())
             self.visibilityChanged.emit()
 
     def set_all_visible(self, on: bool, only: set | None = None) -> None:
@@ -582,6 +616,8 @@ class PlotPanel(QWidget):
             vis = (cid in only) if only is not None else on
             it.setCheckState(Qt.Checked if vis else Qt.Unchecked)
             self._curves[cid].setVisible(vis)
+            if cid in self._inf_marks:
+                self._inf_marks[cid].setVisible(vis)
         self.legend.blockSignals(False)
         self.visibilityChanged.emit()
 

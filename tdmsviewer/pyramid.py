@@ -208,45 +208,66 @@ def _group_merge(n, mn, mx, mu, m2, g: int):
             mean, np.where(tot > 0, m2g, 0.0))
 
 
-def raw_minmax(y: np.ndarray, first: int, bucket: int):
+def raw_minmax(y: np.ndarray, first: int, bucket: int, with_missing: bool = False):
     """Min/max per bucket of raw samples y (index of y[0] is `first`).
 
     Bucket edges are aligned to multiples of `bucket` so the picture does
-    not shimmer while panning. Returns (centers, mins, maxs).
+    not shimmer while panning. Returns (centers, mins, maxs), plus a bool
+    array "bucket has NaN samples" if with_missing.
     """
     n = y.size
     if n == 0:
         e = np.empty(0)
-        return e, e, e
+        return (e, e, e, np.empty(0, dtype=bool)) if with_missing else (e, e, e)
     last = first + n
     a = min(last, -(-first // bucket) * bucket)  # first aligned edge
     b = max(a, (last // bucket) * bucket)  # last aligned edge
-    centers, mins, maxs = [], [], []
+    centers, mins, maxs, miss = [], [], [], []
     if a > first:
         seg = y[: a - first]
         centers.append(np.array([(first + a) / 2.0]))
         mins.append(np.array([np.fmin.reduce(seg)]))
         maxs.append(np.array([np.fmax.reduce(seg)]))
+        if with_missing:
+            miss.append(np.array([bool(np.isnan(seg).any())]))
     if b > a:
         body = y[a - first: b - first].reshape(-1, bucket)
         k = body.shape[0]
         centers.append(a + bucket * (np.arange(k) + 0.5))
         mins.append(np.fmin.reduce(body, axis=1))
         maxs.append(np.fmax.reduce(body, axis=1))
+        if with_missing:
+            miss.append(np.isnan(body).any(axis=1))
     if last > b:
         seg = y[b - first:]
         centers.append(np.array([(b + last) / 2.0]))
         mins.append(np.array([np.fmin.reduce(seg)]))
         maxs.append(np.array([np.fmax.reduce(seg)]))
-    return np.concatenate(centers), np.concatenate(mins), np.concatenate(maxs)
+        if with_missing:
+            miss.append(np.array([bool(np.isnan(seg).any())]))
+    out = (np.concatenate(centers), np.concatenate(mins), np.concatenate(maxs))
+    return out + (np.concatenate(miss),) if with_missing else out
 
 
-def interleave(centers: np.ndarray, mins: np.ndarray, maxs: np.ndarray):
-    """Return (x_index, y) with a min and a max point per bucket."""
-    x = np.repeat(centers, 2)
-    y = np.empty(mins.size * 2)
-    y[0::2] = mins
-    y[1::2] = maxs
+def interleave(centers: np.ndarray, mins: np.ndarray, maxs: np.ndarray, missing=None):
+    """Return (x_index, y) with a min and a max point per bucket.
+
+    missing: bool per bucket (bucket has NaN samples). A NaN point after
+    such a bucket breaks the line, so dropouts stay visible when zoomed out.
+    """
+    if missing is None or not np.any(missing):
+        x = np.repeat(centers, 2)
+        y = np.empty(mins.size * 2)
+        y[0::2] = mins
+        y[1::2] = maxs
+        return x, y
+    per = np.where(missing, 3, 2)
+    start = np.concatenate(([0], np.cumsum(per)[:-1]))
+    total = int(per.sum())
+    x = np.repeat(centers, per)
+    y = np.full(total, np.nan)
+    y[start] = mins
+    y[start + 1] = maxs
     return x, y
 
 
@@ -408,26 +429,28 @@ class Pyramid:
             return st
         return Stats(st.n, st.min, st.max, ref + st.mean, st.m2)
 
-    def minmax(self, w0: int, w1: int, bucket: int, read_raw):
+    def minmax(self, w0: int, w1: int, bucket: int, read_raw, with_missing: bool = False):
         """Envelope of [w0, w1) with aligned buckets of `bucket` samples.
 
         bucket must be a power of two >= base. Only the covered prefix is
-        returned. Returns (centers, mins, maxs).
+        returned. Returns (centers, mins, maxs), plus a bool array "bucket
+        has NaN samples" if with_missing.
         """
         w0 = max(0, w0)
         w1 = min(self.covered, w1)
         e = np.empty(0)
         if w1 <= w0:
-            return e, e, e
+            return (e, e, e, np.empty(0, dtype=bool)) if with_missing else (e, e, e)
         a = min(w1, -(-w0 // bucket) * bucket)
         b = max(a, (w1 // bucket) * bucket)
-        centers, mins, maxs = [], [], []
+        centers, mins, maxs, miss = [], [], [], []
 
         def edge(p, q):
             s = self.stats(p, q, read_raw)
             centers.append(np.array([(p + q) / 2.0]))
             mins.append(np.array([s.min if s else np.nan]))
             maxs.append(np.array([s.max if s else np.nan]))
+            miss.append(np.array([bool(s is not None and s.n < q - p)]))
 
         if a > w0:
             edge(w0, a)
@@ -445,6 +468,9 @@ class Pyramid:
             centers.append(a + bucket * (np.arange(k) + 0.5))
             mins.append(mn)
             maxs.append(mx)
+            if with_missing:
+                miss.append(lv.n[p:q].reshape(k, g).sum(axis=1) < bucket)
         if w1 > b:
             edge(b, w1)
-        return np.concatenate(centers), np.concatenate(mins), np.concatenate(maxs)
+        out = (np.concatenate(centers), np.concatenate(mins), np.concatenate(maxs))
+        return out + (np.concatenate(miss),) if with_missing else out

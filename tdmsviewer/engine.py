@@ -649,22 +649,22 @@ class DataEngine(QObject):
         rr = lambda a, z: self._read_f64(st, a, z)  # noqa: E731
         if p is not None and b >= p.base:
             if p.covered >= i1:
-                c, mn, mx = p.minmax(i0, i1, b, rr)
+                c, mn, mx, miss = p.minmax(i0, i1, b, rr, with_missing=True)
                 complete = True
             elif n <= self._raw_plot_max(st):
-                c, mn, mx = pyr.raw_minmax(self._read_f64(st, i0, i1), i0, b)
+                c, mn, mx, miss = pyr.raw_minmax(self._read_f64(st, i0, i1), i0, b, with_missing=True)
                 complete = True
             else:
                 # Still loading: draw the finished part, refine later.
-                c, mn, mx = p.minmax(i0, i1, b, rr)
+                c, mn, mx, miss = p.minmax(i0, i1, b, rr, with_missing=True)
                 complete = False
         elif p is None and n > self._raw_plot_max(st) * 8:
             return None
         else:
             # Bucket smaller than the pyramid base: n < base * px samples.
-            c, mn, mx = pyr.raw_minmax(self._read_f64(st, i0, i1), i0, b)
+            c, mn, mx, miss = pyr.raw_minmax(self._read_f64(st, i0, i1), i0, b, with_missing=True)
             complete = True
-        x, yy = pyr.interleave(c, mn, mx)
+        x, yy = pyr.interleave(c, mn, mx, miss)
         return xmap.index_to_x(x), yy, complete
 
     @staticmethod
@@ -745,14 +745,17 @@ class DataEngine(QObject):
             res["range"] = (s, e)
             if e <= s:
                 res["stats"] = pyr.EMPTY
+                res["total"] = 0
             elif self._can_read_cheap(st, e - s):
                 xs = xmap.x[s:e]
                 sel = (xs >= req.xa) & (xs <= req.xb)
                 res["stats"] = pyr.raw_stats(self._read_f64(st, s, e)[sel])
+                res["total"] = int(sel.sum())
         else:
             i0, i1 = inner_range(xmap, req.xa, req.xb, s, e)
             res["range"] = (i0, i1)
             n = i1 - i0
+            res["total"] = max(0, n)
             if n <= 0:
                 res["stats"] = pyr.EMPTY
             else:
@@ -893,9 +896,20 @@ def inner_range(xmap, xa: float, xb: float, s: int, e: int) -> tuple[int, int]:
         fb = (xb - xmap.x0) / xmap.dx
         if not (math.isfinite(fa) and math.isfinite(fb)):
             return s, e
-        i0 = int(math.ceil(fa - 1e-9))
-        i1 = int(math.floor(fb + 1e-9)) + 1
-        return max(s, min(e, i0)), max(s, min(e, i1))
+        # Decide the edges in x space with the same formula as the plot (x_of),
+        # so a sample drawn exactly on the view edge is always inside.
+        x_of = xmap.x_of
+        i0 = max(s, min(e, int(math.ceil(fa))))
+        while i0 > s and x_of(i0 - 1) >= xa:
+            i0 -= 1
+        while i0 < e and x_of(i0) < xa:
+            i0 += 1
+        i1 = max(s, min(e, int(math.floor(fb)) + 1))
+        while i1 < e and x_of(i1) <= xb:
+            i1 += 1
+        while i1 > s and x_of(i1 - 1) > xb:
+            i1 -= 1
+        return i0, max(i0, i1)
     if not xmap.monotonic:
         return s, e
     seg = xmap.x[s:e]

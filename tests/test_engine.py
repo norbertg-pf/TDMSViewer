@@ -26,6 +26,7 @@ import pytest  # noqa: E402
 from nptdms import TdmsFile  # noqa: E402
 from tdms_builders import exact_ns  # noqa: E402
 
+from engine_helpers import split_breaks  # noqa: E402
 from engine_helpers import (  # noqa: E402
     Driver, as_f64, assert_stats, check_envelope, nan_equal, ref_stats, same_values,
     split_channels, time_to_seconds, write_interleaved, write_segments,
@@ -471,6 +472,7 @@ def test_plot_spikes_are_preserved(drv, main_file):
         assert complete
         assert y.size < N // 10
         edges = check_envelope(x, y, sig, i0, i1, lin_to_index(xm))
+        x, y, _ = split_breaks(x, y)  # 2 points per bucket from here on
         for i in (*UP, *DOWN):
             k = int(np.searchsorted(edges, i, side="right")) - 1
             lo, hi = y[2 * k], y[2 * k + 1]

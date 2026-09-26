@@ -232,8 +232,9 @@ class ValuesView(QTableView):
 
 # -- statistics --------------------------------------------------------------------
 
-STATS_COLUMNS = ["#", "Channel", "Unit", "N", "Min", "Max", "Peak-peak", "Mean", "Std dev", "RMS",
+STATS_COLUMNS = ["#", "Channel", "Unit", "N", "NaN", "Min", "Max", "Peak-peak", "Mean", "Std dev", "RMS",
                  "C1", "C2", "C2 − C1"]
+_C_N, _C_NAN, _C_FIRST_VAL, _C_LAST_VAL, _C_C1, _C_C2, _C_DIFF = 3, 4, 5, 10, 11, 12, 13
 
 
 class StatsModel(QAbstractTableModel):
@@ -277,45 +278,40 @@ class StatsModel(QAbstractTableModel):
             return c.unit
         res = self.values.get(c.id)
         if res is None:
-            return "" if col < 10 else ""
+            return ""
         s: Stats | None = res.get("stats")
         fmt = (lambda v: format_value(float(v))) if exact else (lambda v: format_si(v, 7))
-        if 3 <= col <= 9:
+        if _C_N <= col <= _C_LAST_VAL:
             if s is None:
-                return "…"
-            if col == 3:
+                return "\u2026"
+            if col == _C_N:
                 return str(s.n)
+            if col == _C_NAN:
+                total = res.get("total")
+                return "" if total is None else str(max(0, total - s.n))
             if s.n == 0:
                 return ""
-            v = (s.min, s.max, s.p2p, s.mean, s.std, s.rms)[col - 4]
+            v = (s.min, s.max, s.p2p, s.mean, s.std, s.rms)[col - _C_FIRST_VAL]
             return fmt(v)
         cur = res.get("cursors") or []
-        vals = []
-        for k in range(2):
-            item = cur[k] if k < len(cur) else None
-            vals.append(None if item is None else item[2])
-        if col in (10, 11):
-            v = vals[col - 10]
+        vals = [None if k >= len(cur) or cur[k] is None else cur[k][2] for k in range(2)]
+        if col in (_C_C1, _C_C2):
+            v = vals[col - _C_C1]
             if v is None:
                 return ""
             return format_value(v) if exact or not isinstance(v, (float, np.floating)) else format_si(float(v), 7)
-        if col == 12:
-            a, b = vals
-            try:
-                d = float(b) - float(a)
-            except (TypeError, ValueError):
-                return ""
-            return fmt(d)
+        if col == _C_DIFF:
+            return _difference(vals[0], vals[1], exact, fmt)
         return ""
 
     def data(self, index, role=Qt.DisplayRole):
         if role == Qt.DisplayRole:
             return self._cell(index.row(), index.column())
-        if role == Qt.ToolTipRole and index.column() >= 3:
+        if role == Qt.ToolTipRole and index.column() >= _C_N:
             return self._cell(index.row(), index.column(), exact=True)
         if role == Qt.TextAlignmentRole:
             return int((Qt.AlignLeft if index.column() in (1, 2) else Qt.AlignRight) | Qt.AlignVCenter)
-        if role == Qt.FontRole and index.column() >= 3:
+        if role == Qt.FontRole and index.column() >= _C_N:
             return self._font
         if role == Qt.ForegroundRole and index.column() == 0:
             return theme.plot_color(self.rows[index.row()][0])
@@ -326,6 +322,22 @@ class StatsModel(QAbstractTableModel):
         for r in range(len(self.rows)):
             lines.append("\t".join(self._cell(r, c, exact=True) for c in range(len(STATS_COLUMNS))))
         return "\n".join(lines)
+
+
+def _difference(a, b, exact: bool, fmt) -> str:
+    """C2 - C1 without loss: integers as integers, timestamps in seconds."""
+    if a is None or b is None:
+        return ""
+    if isinstance(a, np.datetime64) and isinstance(b, np.datetime64):
+        ns = int((b.astype("datetime64[ns]") - a.astype("datetime64[ns]")) / np.timedelta64(1, "ns"))
+        return f"{ns / 1e9!r} s" if exact else f"{format_si(ns / 1e9, 9)} s"
+    ints = (int, np.integer, bool, np.bool_)
+    if isinstance(a, ints) and isinstance(b, ints):
+        return str(int(b) - int(a))  # exact for int64/uint64
+    try:
+        return fmt(float(b) - float(a))
+    except (TypeError, ValueError):
+        return ""
 
 
 # -- properties --------------------------------------------------------------------

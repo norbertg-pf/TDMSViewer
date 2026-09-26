@@ -222,6 +222,7 @@ class MainWindow(QMainWindow):
         self.stats_view.setColumnWidth(0, 36)
         self.stats_view.setColumnWidth(1, 220)
         self.stats_view.setColumnWidth(2, 50)
+        self.stats_view.setColumnWidth(4, 50)
         self.stats_view.setAlternatingRowColors(True)
         self.stats_label = QLabel("")
         self.stats_label.setTextInteractionFlags(Qt.TextSelectableByMouse)

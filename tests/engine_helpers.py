@@ -337,15 +337,33 @@ def bucket_edges(centers_idx: np.ndarray, i0: int) -> np.ndarray:
     return np.array(edges)
 
 
+def split_breaks(x, y):
+    """Remove NaN break points: returns (x, y) with 2 points per bucket and a bool per bucket."""
+    xs, ys, breaks = [], [], []
+    i, n = 0, x.size
+    while i < n:
+        assert i + 1 < n, "bucket without max point"
+        xs += [x[i], x[i + 1]]
+        ys += [y[i], y[i + 1]]
+        i += 2
+        brk = i < n and x[i] == x[i - 1] and np.isnan(y[i])
+        breaks.append(bool(brk))
+        if brk:
+            i += 1
+    return np.asarray(xs, dtype=float), np.asarray(ys, dtype=float), np.asarray(breaks, dtype=bool)
+
+
 def check_envelope(x, y, samples, i0, i1, x_to_index, complete=True):
     """Assert that (x, y) is an exact min/max envelope of samples[i0:i1].
 
-    x, y: plot output (two points per bucket: min then max).
+    x, y: plot output (two points per bucket: min then max; a bucket with
+    NaN samples is followed by a NaN "break" point with the same x).
     samples: float64 values of the whole channel.
     x_to_index: maps plot x back to fractional sample index.
     Returns the bucket edges (int array).
     """
-    assert x.size == y.size and x.size % 2 == 0, (x.size, y.size)
+    assert x.size == y.size, (x.size, y.size)
+    x, y, breaks = split_breaks(x, y)
     assert np.array_equal(x[0::2], x[1::2]), "min and max of a bucket share one x"
     ci = x_to_index(x[0::2])
     half = np.round(2.0 * ci) / 2.0
@@ -365,6 +383,8 @@ def check_envelope(x, y, samples, i0, i1, x_to_index, complete=True):
     exp_max = np.fmax.reduceat(seg, starts)
     assert nan_equal(y[0::2], exp_min), "bucket minimum differs from brute force"
     assert nan_equal(y[1::2], exp_max), "bucket maximum differs from brute force"
+    has_nan = np.logical_or.reduceat(np.isnan(seg), starts) if seg.size else np.zeros(0, bool)
+    assert np.array_equal(breaks, has_nan), "a line break must follow exactly the buckets with NaN"
     # Whole-window envelope equals brute force.
     if seg.size and not np.all(np.isnan(seg)):
         assert np.nanmin(y) == np.nanmin(seg)
