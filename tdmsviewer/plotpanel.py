@@ -33,6 +33,8 @@ from .formatting import format_duration, format_si
 from .xaxis import FMT_ABSOLUTE, FMT_NUMBER, FMT_RELATIVE, TimeAxisItem, TimeRef
 
 TOOL_ZOOM, TOOL_ZOOMX, TOOL_ZOOMY, TOOL_PAN = "zoom", "zoomx", "zoomy", "pan"
+TOOL_ZOOMPT = "zoompt"  # click: zoom in 2x about the point, Shift+click: zoom out
+STYLE_LINE, STYLE_POINTS, STYLE_BOTH = "line", "points", "both"
 _ZOOM_TOOLS = (TOOL_ZOOM, TOOL_ZOOMX, TOOL_ZOOMY)
 MARGIN = 0.25  # extra data fetched on each side of the view (fraction of width)
 SPARSE_PX_PER_POINT = 8.0  # show point markers when points are this far apart
@@ -91,6 +93,12 @@ class GraphViewBox(pg.ViewBox):
         if ev.button() == Qt.LeftButton and ev.double():
             ev.accept()
             self.sigFit.emit()
+            return
+        if ev.button() == Qt.LeftButton and self.tool == TOOL_ZOOMPT:
+            ev.accept()
+            self.sigBeforeChange.emit()
+            f = 2.0 if ev.modifiers() & Qt.ShiftModifier else 0.5
+            self.scaleBy((f, f), center=self.mapToView(ev.pos()))
             return
         super().mouseClickEvent(ev)
 
@@ -195,6 +203,11 @@ def _tool_icon(kind: str) -> QIcon:
         arrow(10, 10, 10, 18.5)
         p.drawLine(QPointF(4, 1), QPointF(16, 1))
         p.drawLine(QPointF(4, 19), QPointF(16, 19))
+    elif kind == TOOL_ZOOMPT:
+        p.drawEllipse(QRectF(2, 2, 11, 11))
+        p.drawLine(QPointF(12, 12), QPointF(18, 18))
+        p.drawLine(QPointF(5, 7.5), QPointF(10, 7.5))
+        p.drawLine(QPointF(7.5, 5), QPointF(7.5, 10))
     elif kind == TOOL_PAN:
         for (x2, y2) in ((10, 1.5), (10, 18.5), (1.5, 10), (18.5, 10)):
             arrow(10, 10, x2, y2)
@@ -228,6 +241,9 @@ class PlotPanel(QWidget):
         pg.setConfigOptions(antialias=False, background=theme.PLOT_BG, foreground=theme.PLOT_FG)
         self._curves: dict[int, pg.PlotDataItem] = {}
         self._inf_marks: dict[int, pg.ScatterPlotItem] = {}
+        self._styles: dict[int, dict] = {}  # current plots: color, width, mode
+        self._user_styles: dict[int, dict] = {}  # styles set in the legend (this session)
+        self._sparse: dict[int, bool] = {}
         self._entries: dict[int, LegendEntry] = {}
         self._history: list = []
         self._last_push = 0.0
@@ -258,7 +274,9 @@ class PlotPanel(QWidget):
         pb.addWidget(self.btn_fit)
         self._tool_buttons = {}
         for tool, tip in ((TOOL_ZOOM, "Zoom to rectangle (Z)"), (TOOL_ZOOMX, "Zoom X only (X)"),
-                          (TOOL_ZOOMY, "Zoom Y only (Y)"), (TOOL_PAN, "Pan (P). Middle drag pans in all tools")):
+                          (TOOL_ZOOMY, "Zoom Y only (Y)"),
+                          (TOOL_ZOOMPT, "Zoom about point: click zooms in, Shift+click zooms out"),
+                          (TOOL_PAN, "Pan (P). Middle drag pans in all tools")):
             b = self._tool_button(tool, tip, checkable=True)
             b.clicked.connect(lambda _=False, t=tool: self.set_tool(t))
             self.tool_group.addButton(b)
@@ -369,6 +387,8 @@ class PlotPanel(QWidget):
         for m in self._inf_marks.values():
             self.vb.removeItem(m)
         self._inf_marks.clear()
+        self._styles.clear()
+        self._sparse.clear()
         self._entries = {e.cid: e for e in entries}
         self.legend.blockSignals(True)
         self.legend.clear()
@@ -379,7 +399,11 @@ class PlotPanel(QWidget):
             if e.enabled:
                 it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
                 it.setCheckState(Qt.Checked)
-                curve = pg.PlotDataItem(pen=pg.mkPen(e.color, width=1), connect="finite",
+                st = dict(self._user_styles.get(e.cid) or {"color": QColor(e.color), "width": 1,
+                                                           "mode": STYLE_LINE})
+                self._styles[e.cid] = st
+                it.setIcon(_line_icon(st["color"], True))
+                curve = pg.PlotDataItem(pen=pg.mkPen(st["color"], width=st["width"]), connect="finite",
                                         antialias=False, autoDownsample=False, clipToView=False)
                 curve.setZValue(10 + len(entries) - e.number)
                 self.vb.addItem(curve)
@@ -404,12 +428,44 @@ class PlotPanel(QWidget):
             if span > 0:
                 visible = int(np.count_nonzero((x >= x0) & (x <= x1))) if x.size < 200000 else x.size
                 sparse = visible * SPARSE_PX_PER_POINT <= w
-        if sparse:
-            e = self._entries[cid]
-            curve.setData(x, y, connect="finite", symbol="o", symbolSize=5,
-                          symbolPen=pg.mkPen(e.color), symbolBrush=pg.mkBrush(e.color))
-        else:
-            curve.setData(x, y, connect="finite", symbol=None)
+        self._sparse[cid] = sparse
+        curve.setData(x, y, connect="finite", **self._style_args(cid, sparse))
+
+    def _style_args(self, cid: int, sparse: bool) -> dict:
+        """pyqtgraph pen/symbol arguments of a plot's style."""
+        st = self._styles.get(cid) or {"color": QColor("#000"), "width": 1, "mode": STYLE_LINE}
+        col = st["color"]
+        pen = pg.mkPen(col, width=st["width"]) if st["mode"] != STYLE_POINTS else None
+        points = st["mode"] in (STYLE_POINTS, STYLE_BOTH) or sparse
+        if points:
+            return {"pen": pen, "symbol": "o", "symbolSize": 4 + st["width"],
+                    "symbolPen": pg.mkPen(col), "symbolBrush": pg.mkBrush(col)}
+        return {"pen": pen, "symbol": None}
+
+    def _apply_style(self, cid: int) -> None:
+        curve = self._curves.get(cid)
+        if curve is None:
+            return
+        args = self._style_args(cid, self._sparse.get(cid, False))
+        curve.setPen(args["pen"])
+        curve.setSymbol(args["symbol"])
+        if args["symbol"]:
+            curve.setSymbolSize(args["symbolSize"])
+            curve.setSymbolPen(args["symbolPen"])
+            curve.setSymbolBrush(args["symbolBrush"])
+        for i in range(self.legend.count()):
+            it = self.legend.item(i)
+            if it.data(Qt.UserRole) == cid:
+                it.setIcon(_line_icon(self._styles[cid]["color"], True))
+
+    def set_style(self, cids, **changes) -> None:
+        """Change color / width / mode of plots (view only; the file is not changed)."""
+        for cid in cids:
+            if cid not in self._styles:
+                continue
+            self._styles[cid].update(changes)
+            self._user_styles[cid] = dict(self._styles[cid])
+            self._apply_style(cid)
 
     def _clamp_inf(self, cid: int, x: np.ndarray, y: np.ndarray) -> np.ndarray:
         """Draw +/-Inf samples at the edge of the finite data, with red triangles.
@@ -623,12 +679,41 @@ class PlotPanel(QWidget):
 
     def _legend_menu(self, pos) -> None:
         m = QMenu(self)
-        sel = {it.data(Qt.UserRole) for it in self.legend.selectedItems()}
+        item = self.legend.itemAt(pos)
+        if item is not None and not item.isSelected():
+            self.legend.clearSelection()
+            item.setSelected(True)
+        sel = [it.data(Qt.UserRole) for it in self.legend.selectedItems() if it.data(Qt.UserRole) in self._curves]
         m.addAction("Show all", lambda: self.set_all_visible(True))
         m.addAction("Hide all", lambda: self.set_all_visible(False))
         if sel:
-            m.addAction("Show only selected", lambda: self.set_all_visible(True, only=sel))
+            m.addAction("Show only selected", lambda: self.set_all_visible(True, only=set(sel)))
+            m.addSeparator()
+            m.addAction("Color...", lambda: self._pick_color(sel))
+            wm = m.addMenu("Line width")
+            for w in (1, 2, 3, 4):
+                wm.addAction(str(w), lambda w=w: self.set_style(sel, width=w))
+            sm = m.addMenu("Plot style")
+            for label, mode in (("Line", STYLE_LINE), ("Points", STYLE_POINTS), ("Line and points", STYLE_BOTH)):
+                sm.addAction(label, lambda mode=mode: self.set_style(sel, mode=mode))
+            m.addAction("Reset style", lambda: self._reset_style(sel))
         m.exec(self.legend.mapToGlobal(pos))
+
+    def _pick_color(self, cids) -> None:
+        from PySide6.QtWidgets import QColorDialog
+
+        start = self._styles[cids[0]]["color"] if cids and cids[0] in self._styles else QColor("#000")
+        col = QColorDialog.getColor(start, self, "Plot color")
+        if col.isValid():
+            self.set_style(cids, color=col)
+
+    def _reset_style(self, cids) -> None:
+        for cid in cids:
+            self._user_styles.pop(cid, None)
+            e = self._entries.get(cid)
+            if e is not None and cid in self._styles:
+                self._styles[cid] = {"color": QColor(e.color), "width": 1, "mode": STYLE_LINE}
+                self._apply_style(cid)
 
     # -- hover ------------------------------------------------------------------------
 

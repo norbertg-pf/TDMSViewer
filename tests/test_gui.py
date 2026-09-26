@@ -214,3 +214,56 @@ def test_real_sample_file(qtbot, win):
     # NI shows 44275 samples at 1 s per sample: 0 .. 12:17:54.
     x0, x1 = win.plot.view_x_range()
     assert (x0, x1) == (0.0, 44274.0)
+
+
+def test_legend_styles_and_zoom_about_point(qtbot, win, gui_file):
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QColor
+
+    from tdmsviewer.plotpanel import STYLE_BOTH, STYLE_POINTS, TOOL_ZOOMPT
+
+    _open(qtbot, win, gui_file)
+    _select(win, win.tree.topLevelItem(0).child(0))
+    qtbot.wait(300)
+    cid = win.current[0].id
+    curve = win.plot._curves[cid]
+    win.plot.set_style([cid], color=QColor("#123456"), width=3)
+    assert curve.opts["pen"].width() == 3 and curve.opts["pen"].color().name() == "#123456"
+    win.plot.set_style([cid], mode=STYLE_POINTS)
+    assert curve.opts["pen"].style() == Qt.NoPen and curve.opts["symbol"] == "o"  # points only
+    win.plot.set_style([cid], mode=STYLE_BOTH)
+    assert curve.opts["pen"].style() != Qt.NoPen and curve.opts["symbol"] == "o"
+    # The style stays when the channel is shown again (same session).
+    _select(win, win.tree.topLevelItem(0).child(0).child(0))
+    qtbot.wait(300)
+    assert win.plot._curves[cid].opts["pen"].width() == 3
+    # Zoom about point: click zooms in 2x around the point.
+    win.plot.set_tool(TOOL_ZOOMPT)
+    x0, x1 = win.plot.view_x_range()
+    vb = win.plot.vb
+
+    class Ev:
+        def __init__(self, shift):
+            self._shift = shift
+
+        def button(self):
+            return Qt.LeftButton
+
+        def double(self):
+            return False
+
+        def modifiers(self):
+            return Qt.ShiftModifier if self._shift else Qt.NoModifier
+
+        def pos(self):
+            return vb.mapFromView(QPointF((x0 + x1) / 2, 0.0))
+
+        def accept(self):
+            pass
+
+    vb.mouseClickEvent(Ev(False))
+    a, b = win.plot.view_x_range()
+    assert (b - a) == pytest.approx((x1 - x0) / 2, rel=1e-6)
+    vb.mouseClickEvent(Ev(True))
+    a, b = win.plot.view_x_range()
+    assert (b - a) == pytest.approx(x1 - x0, rel=1e-6)
