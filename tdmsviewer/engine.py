@@ -37,6 +37,7 @@ PYR_BASE_RAM = 256
 PYR_MIN_LEN = 4096  # no pyramid below this length (raw decimation is cheap)
 RAW_DECIMATE_MAX = 1 << 24  # max raw samples for statistics on demand
 RAW_PLOT_MAX = 1 << 21  # max raw samples for one plot update
+RAW_PLOT_BUDGET = 1 << 23  # max raw samples read from disk for one request (all channels)
 XY_MAX_POINTS = 1_000_000
 
 
@@ -216,6 +217,7 @@ class DataEngine(QObject):
         self._bg = None
         self._tasks: list = []  # user tasks (generators): export, X values
         self._builds: list = []  # helper-thread futures of the current file
+        self._raw_budget = RAW_PLOT_BUDGET
         self._priority: list[int] = []
         self._pool = futures.ThreadPoolExecutor(max_workers=max(1, min(4, (os.cpu_count() or 2) - 2)),
                                                 thread_name_prefix="tdms-pyramid")
@@ -613,6 +615,7 @@ class DataEngine(QObject):
     def _do_plot(self, gen: int, req: PlotRequest) -> None:
         out = {}
         px = max(16, int(req.pixels))
+        self._raw_budget = RAW_PLOT_BUDGET
         for it in req.items:
             if self._pending("plot"):
                 if out:  # a newer view exists: deliver what is done
@@ -651,21 +654,33 @@ class DataEngine(QObject):
             if p.covered >= i1:
                 c, mn, mx, miss = p.minmax(i0, i1, b, rr, with_missing=True)
                 complete = True
-            elif n <= self._raw_plot_max(st):
+            elif n <= self._raw_plot_max(st) and self._take_raw_budget(st, n):
                 c, mn, mx, miss = pyr.raw_minmax(self._read_f64(st, i0, i1), i0, b, with_missing=True)
                 complete = True
             else:
                 # Still loading: draw the finished part, refine later.
                 c, mn, mx, miss = p.minmax(i0, i1, b, rr, with_missing=True)
                 complete = False
-        elif p is None and n > self._raw_plot_max(st) * 8:
-            return None
+        elif p is None and (n > self._raw_plot_max(st) * 8 or not self._take_raw_budget(st, n)):
+            return None  # not loaded yet: drawn when channelsUpdated arrives
         else:
             # Bucket smaller than the pyramid base: n < base * px samples.
             c, mn, mx, miss = pyr.raw_minmax(self._read_f64(st, i0, i1), i0, b, with_missing=True)
             complete = True
         x, yy = pyr.interleave(c, mn, mx, miss)
         return xmap.index_to_x(x), yy, complete
+
+    def _take_raw_budget(self, st: _Store, n: int) -> bool:
+        """Charge n raw samples of a channel without RAM copy to this plot request.
+
+        While a file loads, this stops one view update from reading whole channels.
+        """
+        if st.ram is not None:
+            return True
+        if n > self._raw_budget:
+            return False
+        self._raw_budget -= n
+        return True
 
     @staticmethod
     def _raw_plot_max(st: _Store) -> int:

@@ -279,7 +279,7 @@ def test_levels_structure(shape, base, rng):
     if shape == "multi":
         assert len(p.levels) == 4
     assert p.levels[0].n.sum() == np.count_nonzero(~np.isnan(y))
-    assert p.nbytes == sum(5 * lv.n.nbytes for lv in p.levels)
+    assert p.nbytes == sum(6 * lv.n.nbytes for lv in p.levels)
 
 
 @pytest.mark.parametrize("block", [1, 7, 255, 256, 257, 10_000])
@@ -294,7 +294,7 @@ def test_block_sizes_give_same_pyramid(block, rng):
     for a, b in zip(p.levels, ref.levels):
         for name in ("n", "mn", "mx"):
             np.testing.assert_array_equal(getattr(a, name), getattr(b, name))
-        np.testing.assert_allclose(a.mu[a.n > 0], b.mu[b.n > 0], rtol=1e-13)
+        np.testing.assert_allclose(a.mean[a.n > 0], b.mean[b.n > 0], rtol=1e-13)
 
 
 def test_append_converts_to_float64(rng):
