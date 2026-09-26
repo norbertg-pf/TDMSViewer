@@ -27,3 +27,6 @@ include = ["tdmsviewer*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 qt_api = "pyside6"
+
+[tool.setuptools.package-data]
+tdmsviewer = ["*.svg"]

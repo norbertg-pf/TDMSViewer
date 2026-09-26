@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=TDMS Viewer
+GenericName=TDMS file viewer
+Comment=Fast, read-only viewer for NI TDMS files
+Exec=tdmsviewer %f
+Icon=tdmsviewer
+Terminal=false
+Categories=Science;Engineering;Viewer;
+MimeType=application/x-tdms;
+StartupWMClass=tdmsviewer
