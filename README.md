@@ -4,12 +4,16 @@ Fast, read-only viewer for NI TDMS files on Ubuntu. It has the functions
 of the NI "TDMS File Viewer" and adds tools for fast analysis. It is
 free and open source (Python, Qt).
 
-Run from the source folder:
+Run from the source folder, in its own virtual environment (`.venv`):
 
 ```bash
-python3 -m pip install -r requirements.txt   # once
-python3 main.py measurement.tdms             # the file is optional
+./run.sh measurement.tdms    # first start: makes .venv and installs (~1 min, ~760 MB)
+python3 main.py              # later: main.py uses .venv automatically
 ```
+
+Without a virtual environment: `python3 -m pip install -r requirements.txt`,
+then `TDMSVIEWER_NO_VENV=1 python3 main.py`. An active virtual environment
+of your own is always used as it is.
 
 Or install it for your user (command `tdmsviewer`, menu entry, double-click
 on `.tdms` files):

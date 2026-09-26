@@ -7,7 +7,15 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Use the project virtual environment (.venv, made by run.sh) if it exists.
+_venv_python = os.path.join(HERE, ".venv", "bin", "python")
+if (os.path.exists(_venv_python) and sys.prefix == sys.base_prefix
+        and not os.environ.get("TDMSVIEWER_NO_VENV")):
+    os.execv(_venv_python, [_venv_python, os.path.abspath(__file__), *sys.argv[1:]])
+
+sys.path.insert(0, HERE)
 
 _missing = []
 for _mod, _pkg in (("numpy", "numpy"), ("nptdms", "npTDMS"), ("PySide6", "PySide6"), ("pyqtgraph", "pyqtgraph")):
@@ -17,7 +25,8 @@ for _mod, _pkg in (("numpy", "numpy"), ("nptdms", "npTDMS"), ("PySide6", "PySide
         _missing.append(_pkg)
 if _missing:
     sys.exit("Missing Python packages: " + ", ".join(_missing) + "\n"
-             "Install them with:\n    python3 -m pip install " + " ".join(_missing))
+             "Start with ./run.sh (it makes a virtual environment), or install them:\n"
+             "    python3 -m pip install " + " ".join(_missing))
 
 from tdmsviewer.app import main  # noqa: E402
 
