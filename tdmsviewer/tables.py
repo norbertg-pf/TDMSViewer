@@ -10,6 +10,8 @@ Summary
 from __future__ import annotations
 
 
+import math
+
 import numpy as np
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QGuiApplication, QKeySequence
@@ -291,7 +293,17 @@ class StatsModel(QAbstractTableModel):
                 return "" if total is None else str(max(0, total - s.n))
             if s.n == 0:
                 return ""
-            v = (s.min, s.max, s.p2p, s.mean, s.std, s.rms)[col - _C_FIRST_VAL]
+            k = col - _C_FIRST_VAL
+            off = res.get("offset")
+            if off is not None and k in (0, 1):  # int64/uint64 min/max: exact integers
+                v = off + int(round((s.min, s.max)[k]))
+                return str(v) if exact else format_si(float(v), 7)
+            if off is not None and k in (3, 5):  # mean, RMS of absolute values
+                mean = float(off) + s.mean
+                if k == 3:
+                    return fmt(mean)
+                return fmt(math.sqrt(mean * mean + s.m2 / s.n))
+            v = (s.min, s.max, s.p2p, s.mean, s.std, s.rms)[k]
             return fmt(v)
         cur = res.get("cursors") or []
         vals = [None if k >= len(cur) or cur[k] is None else cur[k][2] for k in range(2)]

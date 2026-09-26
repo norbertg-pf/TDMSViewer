@@ -29,7 +29,7 @@ import numpy as np
 from PySide6.QtCore import QObject, Signal
 
 from . import pyramid as pyr
-from .tdmsfile import KIND_BOOL, KIND_COMPLEX, KIND_TIME, PLOTTABLE, ChannelInfo, TdmsSource
+from .tdmsfile import KIND_BOOL, KIND_COMPLEX, KIND_INT, KIND_TIME, PLOTTABLE, ChannelInfo, TdmsSource
 from .xaxis import ArrayMap, LinearMap, TimeRef, is_monotonic
 
 BLOCK = 1 << 22  # samples per load step
@@ -172,10 +172,29 @@ def _first_time(a: np.ndarray):
     return ok[0].astype("datetime64[ns]") if ok.size else np.datetime64(0, "ns")
 
 
+def _big_int(info: ChannelInfo) -> bool:
+    """int64/uint64: float64 cannot hold every value (> 2**53)."""
+    return info.kind == KIND_INT and info.dtype.itemsize == 8
+
+
+def _int_zero(a: np.ndarray):
+    """Integer offset of an int64/uint64 channel: its first sample (Python int)."""
+    return int(a[0]) if a.size else 0
+
+
 def to_f64(a: np.ndarray, kind: str, t0=None) -> np.ndarray:
-    """Plot values (float64) of native channel values."""
+    """Plot values (float64) of native channel values.
+
+    t0: zero for timestamps (datetime64) and for int64/uint64 (Python int).
+    Integers are made relative to t0 before the float conversion, so
+    differences stay exact while the channel range is below 2**53.
+    """
     if a.dtype == np.float64:
         return a
+    if kind == KIND_INT and t0 is not None and a.dtype.itemsize == 8:
+        if a.dtype.kind == "u":
+            return (a.astype(np.uint64) - np.uint64(t0)).view(np.int64).astype(np.float64)
+        return (a.astype(np.int64) - np.int64(t0)).astype(np.float64)
     if kind == KIND_TIME:
         if t0 is None:
             t0 = np.datetime64(0, "ns")
@@ -485,6 +504,8 @@ class DataEngine(QObject):
             return
         if info.kind == KIND_TIME and st.t0 is None:
             st.t0 = _first_time(src.read(info.id, 0, min(n, 1024)))
+        elif _big_int(info) and st.t0 is None:
+            st.t0 = _int_zero(src.read(info.id, 0, 1))
         want_pyr = info.plottable and n >= PYR_MIN_LEN
         label = f"Loading {info.label}"
         if st.to_ram:
@@ -544,6 +565,8 @@ class DataEngine(QObject):
             info = st.info
             if info.kind == KIND_TIME and st.t0 is None:
                 st.t0 = _first_time(a)
+            elif _big_int(info) and st.t0 is None:
+                st.t0 = _int_zero(a) if off == 0 else _int_zero(src.read(cid, 0, 1))
             arr = arrays[cid]
             if arr is not None:
                 arr[off:off + a.size] = a
@@ -601,9 +624,18 @@ class DataEngine(QObject):
         return self._source.read(st.info.id, i0, i1)
 
     def _read_f64(self, st: _Store, i0: int, i1: int) -> np.ndarray:
-        if st.info.kind == KIND_TIME and st.t0 is None:
-            st.t0 = _first_time(self._read(st, 0, min(st.info.length, 1024)))
+        """float64 values; timestamps and int64/uint64 relative to st.t0."""
+        if st.t0 is None:
+            if st.info.kind == KIND_TIME:
+                st.t0 = _first_time(self._read(st, 0, min(st.info.length, 1024)))
+            elif _big_int(st.info):
+                st.t0 = _int_zero(self._read(st, 0, 1))
         return to_f64(self._read(st, i0, i1), st.info.kind, st.t0)
+
+    @staticmethod
+    def _y_offset(st: _Store) -> float:
+        """Value to add back to plotted int64/uint64 values (0 for other kinds)."""
+        return float(st.t0) if _big_int(st.info) and st.t0 is not None else 0.0
 
     def _can_read_cheap(self, st: _Store, n: int) -> bool:
         if st.ram is not None or st.fast is not None:
@@ -627,7 +659,11 @@ class DataEngine(QObject):
             if not st.info.plottable:
                 continue
             try:
-                out[it.cid] = self._plot_one(st, it, req.xa, req.xb, px)
+                res = self._plot_one(st, it, req.xa, req.xb, px)
+                off = self._y_offset(st)
+                if res is not None and off:
+                    res = (res[0], res[1] + off, res[2])  # absolute values on the y axis
+                out[it.cid] = res
             except Exception as exc:
                 traceback.print_exc()
                 self.message.emit(gen, f"{st.info.label}: {exc}")
@@ -755,6 +791,9 @@ class DataEngine(QObject):
         if isinstance(xmap, ArrayMap):
             e = min(e, xmap.x.size)
         res = {"range": (s, s), "stats": None, "cursors": []}
+        if _big_int(info):
+            self._read_f64(st, 0, 0)  # sets st.t0
+            res["offset"] = st.t0  # statistics are relative to this integer
         if isinstance(xmap, ArrayMap) and not xmap.monotonic:
             # X-Y plot: the samples whose x is inside [xa, xb], in any order.
             res["range"] = (s, e)
@@ -812,6 +851,8 @@ class DataEngine(QObject):
             if info.length > BLOCK:
                 self.progress.emit(gen, min(0.999, j / info.length), f"Loading X values of {info.label}")
                 yield
+        if _big_int(info) and st.t0:
+            x += float(st.t0)  # absolute values (rounded above 2**53)
         mono = is_monotonic(x)
         t_ref = None
         if info.kind == KIND_TIME and st.t0 is not None:
