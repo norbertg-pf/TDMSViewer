@@ -837,7 +837,7 @@ def scenario_mixed(rng) -> tuple[TdmsBuilder, dict]:
     b = TdmsBuilder()
     dts = {"m_f8": "f8", "m_i4": "i4", "m_u2": "u2", "m_c8": "c8"}
 
-    def vals(n, skip_complex=False):
+    def vals(n):
         return {_p(k): random_values(v, n, rng) for k, v in dts.items()}
 
     b.segment(header_objects([G]) + [Obj(_p(k), random_values(v, 120, rng)) for k, v in dts.items()])
@@ -898,7 +898,8 @@ def build_scenario(name: str, directory, seed: int = 1234, index: bool | int = F
     if name.startswith("truncated_"):
         b, cut, notes = scenario_truncated(rng, name[len("truncated_"):])
         b.write(path, index=index, cut=cut)
-        notes = dict(notes, cut=cut)
+        # npTDMS values are a prefix of builder.expected().
+        notes = dict(notes, cut=cut, exact=False, prefix=True)
         return path, b, notes
     b, notes = SCENARIOS[name](rng)
     b.write(path, index=index)
