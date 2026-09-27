@@ -39,6 +39,10 @@ If Qt reports a missing `xcb` plugin, install the system libraries:
   exact integers.
 - **Nothing is hidden.** ±Inf samples are drawn as red triangles. Samples
   with NaN (dropouts) break the line, also when zoomed out.
+- **Damaged files open.** Garbage or zeros after the last segment (writer
+  crash), a `.tdms_index` from another run, names that are not UTF-8, EXT
+  (80-bit) values and out-of-range timestamps give one clear warning each,
+  never silently wrong data.
 - **Read-only.** The viewer never writes to a TDMS file.
 
 ## Functions
@@ -63,20 +67,28 @@ If Qt reports a missing `xcb` plugin, install the system libraries:
 
 1. **Metadata only at open.** Channel data loads in the background.
 2. **Direct reads.** A reader uses the npTDMS segment table and reads with
-   `preadv`, 3 to 10 times faster than npTDMS. It is compared bit by bit
-   with npTDMS for each channel before use; if not equal, npTDMS is used.
-3. **RAM when it fits.** Channels go to RAM up to 40 % of free memory. Larger
+   `preadv`, 3 to 30 times faster than npTDMS. One pass over the segment
+   table builds all channels; equal segments merge into one part.
+3. **Checked before use.** npTDMS decodes the first values of the first
+   and last segment of each layout kind (and spread segments). The direct
+   reader must give the same bytes; if not, npTDMS is used for that channel.
+4. **One pass for many channels.** Channels written in small pieces (many
+   small segments, interleaved data) load together in one pass over the file.
+5. **RAM when it fits.** Channels go to RAM up to 40 % of free memory. Larger
    files stay on disk.
-4. **Min/max pyramid.** Per 256 samples: count, min, max, mean and M2. Levels
+6. **Min/max pyramid.** Per 256 samples: count, min, max, mean and M2. Levels
    of 8x. A view update touches about 2 values per pixel, not all samples.
-5. **One worker thread** owns the file. The newest request wins. The window
+7. **One worker thread** owns the file. The newest request wins. The window
    never waits for the disk.
 
 ## Downsides and limits
 
 - A channel as X axis must fit in RAM (8 bytes per sample).
-- DAQmx raw, scaled, string and timestamp channels use npTDMS (slower reads).
-- Interleaved and DAQmx files load in one pass of npTDMS `data_chunks()`.
+- DAQmx raw, scaled, string, timestamp and EXT channels use npTDMS (slower
+  reads). In files with interleaved or DAQmx data they load in one pass of
+  npTDMS `data_chunks()`.
+- Opening a file with very many segments is limited by npTDMS: about 65 µs
+  per segment (20 000 segments: 1.4 s; with a `.tdms_index` about 0.4 s).
 - A file that is still being written is shown as it was at open. Use F5.
 - The graph shows the envelope (min/max) when zoomed out. Zoom in to see
   single samples (markers appear when points are far apart).
