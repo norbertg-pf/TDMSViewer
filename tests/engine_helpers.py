@@ -206,7 +206,9 @@ class Driver:
         self.eng = eng
         self.rec = Recorder(eng)
         self.timeout = timeout
-        self._seq = 0
+        # Far above the request numbers that tests send by hand (1, 2, ...): an old
+        # answer with the same number must never be taken as the answer.
+        self._seq = 1_000_000
 
     def seq(self) -> int:
         self._seq += 1

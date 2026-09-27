@@ -102,4 +102,7 @@ python3 -m tdmsviewer file.tdms
 ```
 
 Dependencies: NumPy (BSD), npTDMS (LGPL-3.0), PySide6 (LGPL-3.0),
-pyqtgraph (MIT).
+pyqtgraph (MIT). The test suite passes with the oldest and the newest
+allowed versions: NumPy 1.26 and 2.4, npTDMS 1.11, PySide6 6.8 and 6.11,
+pyqtgraph 0.13.7 and 0.14. npTDMS and pyqtgraph are capped below their next
+minor version, because the viewer uses their internals.
