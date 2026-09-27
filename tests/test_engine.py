@@ -1720,3 +1720,15 @@ def test_fragmented_family_loads_in_one_pass(new_driver, tmp_path, monkeypatch, 
         f = ref.astype(np.float64)
         assert (s.n, s.min, s.max) == (n, f.min(), f.max())
         assert math.isclose(s.mean, f.mean(), rel_tol=1e-12, abs_tol=1e-12)
+
+
+def test_iso_times_exact_to_ns():
+    from tdmsviewer.engine import iso_times
+    from tdmsviewer.xaxis import TimeRef
+
+    ref = TimeRef(1_785_233_136, 0.25)  # 2026-07-28T10:05:36.25Z
+    got = iso_times(ref, np.array([0.0, 1e-9, 0.75, 3600.5, -0.25, np.nan, np.inf, 1e13]))
+    assert got == ["2026-07-28T10:05:36.250000000Z", "2026-07-28T10:05:36.250000001Z",
+                   "2026-07-28T10:05:37.000000000Z", "2026-07-28T11:05:36.750000000Z",
+                   "2026-07-28T10:05:36.000000000Z", "", "", ""]
+    assert iso_times(ref, np.empty(0)) == []

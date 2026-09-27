@@ -126,6 +126,10 @@ class ExportRequest:
     xa: float
     xb: float
     header: list
+    # Absolute time: x is seconds since time_ref (TimeRef). Each channel then
+    # gets a UTC ISO 8601 column after x; empty for channels not in time_cids.
+    time_ref: object = None
+    time_cids: frozenset = frozenset()
 
 
 class _Store:
@@ -1038,6 +1042,7 @@ class DataEngine(QObject):
                     i0, i1 = inner_range(it.xmap, req.xa, req.xb, it.s, e)
                     cols.append((st, it, (i0, i1), max(0, i1 - i0)))
             rows = max((c[3] for c in cols), default=0)
+            timed = req.time_ref is not None
             step = 1 << 16
             with open(part, "w", encoding="utf-8", newline="") as fh:
                 fh.write(",".join(_csv_cell(h) for h in req.header) + "\n")
@@ -1057,16 +1062,21 @@ class DataEngine(QObject):
                         else:
                             idx = sel[r0:a1]
                         raw = self._read(st, int(idx[0]), int(idx[-1]) + 1)
-                        blocks.append((idx, it.xmap.index_to_x(idx), raw[idx - idx[0]]))
+                        xs = it.xmap.index_to_x(idx)
+                        times = iso_times(req.time_ref, xs) if timed and it.cid in req.time_cids else None
+                        blocks.append((idx, xs, raw[idx - idx[0]], times))
                     lines = []
+                    empty = ["", "", "", ""] if timed else ["", "", ""]
                     for k in range(r1 - r0):
                         cells = []
                         for blk in blocks:
                             if blk is not None and k < blk[0].size:
-                                cells += [str(int(blk[0][k])), repr(float(blk[1][k])),
-                                          _csv_cell(format_export(blk[2][k]))]
+                                cells += [str(int(blk[0][k])), repr(float(blk[1][k]))]
+                                if timed:
+                                    cells.append(blk[3][k] if blk[3] is not None else "")
+                                cells.append(_csv_cell(format_export(blk[2][k])))
                             else:
-                                cells += ["", "", ""]
+                                cells += empty
                         lines.append(",".join(cells))
                     fh.write("\n".join(lines) + "\n")
                     self.progress.emit(gen, min(0.999, r1 / max(1, rows)), "Exporting CSV")
@@ -1083,6 +1093,28 @@ class DataEngine(QObject):
                     os.remove(part)
                 except OSError:
                     pass
+
+
+_NS_SAFE_S = 9_000_000_000  # |Unix seconds| that fit datetime64[ns] with margin
+
+
+def iso_times(t_ref, x) -> list[str]:
+    """UTC ISO 8601 texts of t_ref + x (x: seconds, float64), exact to 1 ns.
+
+    t_ref is a TimeRef (whole Unix seconds + fraction), so the sum keeps
+    ns resolution. Non-finite x or dates outside 1685..2255 give "".
+    """
+    t_ref = TimeRef.of(t_ref)
+    f = t_ref.frac + np.asarray(x, dtype=np.float64)
+    with np.errstate(invalid="ignore"):
+        w = np.floor(f)
+        ok = np.isfinite(f) & (np.abs(w + t_ref.sec) < _NS_SAFE_S)
+    f = np.where(ok, f, 0.0)
+    w = np.where(ok, w, 0.0)
+    ns = np.rint((f - w) * 1e9).astype(np.int64)  # 1e9 carries into the seconds below
+    t = ((t_ref.sec + w.astype(np.int64)) * 1_000_000_000 + ns).astype("datetime64[ns]")
+    text = np.datetime_as_string(t, unit="ns")
+    return [s + "Z" if good else "" for s, good in zip(text.tolist(), ok.tolist())]
 
 
 def absolute_stats(res: dict):

@@ -1346,12 +1346,17 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Export", f"{refuse}\n\n{path}\n\nNo file was written.")
             return
         xa, xb = self.plot.view_x_range()
+        t_ref, timed = self._export_time(items)
         header = []
         for it in items:
             c = self.model.channels[it.cid]
-            header += [f"{c.label} index", self._x_header(c), f"{c.label}" + (f" [{c.unit}]" if c.unit else "")]
+            header += [f"{c.label} index", self._x_header(c)]
+            if t_ref is not None:
+                header.append(f"{c.label} time [UTC]")
+            header.append(f"{c.label}" + (f" [{c.unit}]" if c.unit else ""))
         self._export_seq += 1
-        self.engine.request_export(ExportRequest(self._export_seq, path, items, xa, xb, header))
+        self.engine.request_export(ExportRequest(self._export_seq, path, items, xa, xb, header,
+                                                 t_ref, frozenset(timed)))
         self._set_status("Exporting ...")
 
     def _export_refused(self, path: str) -> str:
@@ -1366,6 +1371,22 @@ class MainWindow(QMainWindow):
                 except OSError:
                     pass
         return ""
+
+    def _export_time(self, items) -> tuple:
+        """(TimeRef of x == 0, channel ids with an absolute time) for the CSV time column.
+
+        Waveform time: channels with wf_start_time and wf_increment. Time
+        channel as X: all channels. Otherwise no time column.
+        """
+        src, xcid = self.x_source
+        if src == SRC_WAVE and self.model.t_ref_unix is not None:
+            timed = {it.cid for it in items
+                     if self.model.channels[it.cid].wf_start_time is not None
+                     and self.model.channels[it.cid].wf_increment}
+            return (self.model.t_ref_unix, timed) if timed else (None, set())
+        if src == SRC_CHAN and self.model.channels[xcid].kind == KIND_TIME and self.x_array_tref is not None:
+            return TimeRef.of(self.x_array_tref), {it.cid for it in items}
+        return None, set()
 
     def _x_header(self, c: ChannelInfo) -> str:
         """CSV header of the x column of a channel: unit and time reference of x."""

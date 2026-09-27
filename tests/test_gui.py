@@ -267,3 +267,29 @@ def test_legend_styles_and_zoom_about_point(qtbot, win, gui_file):
     vb.mouseClickEvent(Ev(True))
     a, b = win.plot.view_x_range()
     assert (b - a) == pytest.approx(x1 - x0, rel=1e-6)
+
+
+def test_export_csv_absolute_time_column(qtbot, win, tmp_path, monkeypatch):
+    """wf_start_time + wf_increment: a UTC ISO time column, exact to 1 ns."""
+    path = str(tmp_path / "timed.tdms")
+    t0 = np.datetime64("2026-07-28T10:05:36.000000500", "ns")
+    props = {"wf_increment": 1e-3, "wf_start_offset": 0.0, "wf_start_time": t0}
+    with TdmsWriter(path) as w:
+        w.write_segment([ChannelObject("A", "sig", np.arange(20_000, dtype=np.float64), properties=props),
+                         ChannelObject("A", "plain", np.arange(20_000, dtype=np.float64))])
+    _open(qtbot, win, path)
+    _select(win, win.tree.topLevelItem(0).child(0))
+    qtbot.wait(300)
+    win.plot.set_view(1.0, 1.002)
+    qtbot.wait(300)
+    out = str(tmp_path / "t.csv")
+    monkeypatch.setattr("tdmsviewer.mainwindow.QFileDialog.getSaveFileName", lambda *a, **k: (out, ""))
+    with qtbot.waitSignal(win.engine.exportDone, timeout=5000):
+        win.export_csv()
+    rows = list(csv.reader(open(out)))
+    assert rows[0][2] == "A/sig time [UTC]" and rows[0][6] == "A/plain time [UTC]"
+    assert [r[0] for r in rows[1:]] == ["1000", "1001", "1002"]
+    # The npTDMS writer stores whole us (the 500 ns are lost): 10:05:36.000000 + 1.000 s
+    assert rows[1][2] == "2026-07-28T10:05:37.000000000Z" and rows[2][2] == "2026-07-28T10:05:37.001000000Z"
+    assert rows[1][6] == ""  # no wf_start_time: no absolute time
+    assert float(rows[1][3]) == 1000.0
