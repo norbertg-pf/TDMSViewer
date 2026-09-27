@@ -20,9 +20,9 @@ import math
 import os
 
 import numpy as np
-from PySide6.QtCore import QSettings, Qt, QTimer
-from PySide6.QtGui import QAction, QKeySequence
-from PySide6.QtWidgets import (
+from pyqtgraph.Qt.QtCore import QSettings, Qt, QTimer
+from pyqtgraph.Qt.QtGui import QAction, QKeySequence
+from pyqtgraph.Qt.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSplitter,
     QTableView, QTabWidget, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
@@ -1441,12 +1441,12 @@ class MainWindow(QMainWindow):
 
     def _show_about(self) -> None:
         import nptdms
-        import PySide6
         import pyqtgraph
+        from pyqtgraph.Qt import VERSION_INFO
 
         QMessageBox.about(self, "About TDMS Viewer", (
             f"<b>TDMS Viewer {__version__}</b><br>"
             "Fast, read-only viewer for NI TDMS files.<br><br>"
             f"npTDMS {nptdms.__version__}, pyqtgraph {pyqtgraph.__version__}, "
-            f"PySide6 {PySide6.__version__}, NumPy {np.__version__}<br>"
+            f"{VERSION_INFO}, NumPy {np.__version__}<br>"
             "All components are free and open source."))

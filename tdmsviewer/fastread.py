@@ -3,7 +3,8 @@
 Summary
     Reads channel values 3 to 30 times faster than npTDMS. It uses the
     segment table that npTDMS already parsed and reads bytes with
-    os.preadv. Each reader is verified against npTDMS before use.
+    positional reads (os.preadv; Windows: locked seek + read). Each reader
+    is verified against npTDMS before use.
 
 Rules
     - Only plain, fixed-size numeric data. No DAQmx raw data, no
@@ -12,6 +13,7 @@ Rules
     - No memory map. A file that becomes shorter causes a clean
       error, not a crash (SIGBUS).
     - Thread-safe: preadv does not use the shared file position.
+      Windows has no preadv: seek and read run as one locked pair.
 
 Layout (one pass, O(segments))
     Consecutive segments with the same objects, one chunk each and a
@@ -33,7 +35,9 @@ Verification (bounded cost)
 
 from __future__ import annotations
 
+import io
 import os
+import threading
 from dataclasses import dataclass
 
 import numpy as np
@@ -210,6 +214,41 @@ def read_many(readers: list, start: int, stop: int, outs: list | None = None) ->
     return outs
 
 
+# -- positional reads ----------------------------------------------------------------
+# POSIX: pread/preadv (no shared file position, one system call).
+# Windows has neither: one lock keeps seek and read together. Reads from several
+# threads then run one after the other (Windows does the same for one handle).
+# The fd must be opened with O_BINARY on Windows (text mode changes bytes).
+
+_seek_lock = threading.Lock()
+_seek_files: dict[int, io.FileIO] = {}  # fd -> unowned FileIO (no copy on read)
+
+
+def _seek_readinto(fd: int, mv: memoryview, offset: int) -> int:
+    with _seek_lock:
+        f = _seek_files.get(fd)
+        if f is None:
+            f = _seek_files[fd] = io.FileIO(fd, "rb", closefd=False)
+        f.seek(offset)
+        return f.readinto(mv)
+
+
+def _seek_pread(fd: int, nbytes: int, offset: int) -> bytes:
+    buf = bytearray(nbytes)
+    return bytes(buf[:_seek_readinto(fd, memoryview(buf), offset)])
+
+
+# pread(fd, nbytes, offset) -> bytes, short at the end of the file.
+if hasattr(os, "preadv"):
+    def _readinto_at(fd: int, mv: memoryview, offset: int) -> int:
+        return os.preadv(fd, [mv], offset)
+
+    pread = os.pread
+else:  # pragma: no cover - Windows (tests force this path on Linux)
+    _readinto_at = _seek_readinto
+    pread = _seek_pread
+
+
 # -- read engine ---------------------------------------------------------------------
 
 def _pread_into(fd: int, buf: np.ndarray, offset: int) -> None:
@@ -217,7 +256,7 @@ def _pread_into(fd: int, buf: np.ndarray, offset: int) -> None:
     done = 0
     size = mv.nbytes
     while done < size:
-        n = os.preadv(fd, [mv[done:]], offset + done)
+        n = _readinto_at(fd, mv[done:], offset + done)
         if n <= 0:
             raise FastPathError("File is shorter than its index (file changed on disk?)")
         done += n

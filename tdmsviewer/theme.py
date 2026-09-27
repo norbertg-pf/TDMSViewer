@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtGui import QColor, QFont, QFontDatabase
+from pyqtgraph.Qt.QtGui import QColor, QFont, QFontDatabase
 
 # NI plot order (00..09, then repeats). Light colors are a little darker
 # than NI so that they stay readable on a white background.

@@ -10,3 +10,10 @@ QT_QPA_PLATFORM=offscreen python3 bench/bench_engine.py --files none --extra my.
 ```
 
 `--workdir DIR` selects the disk (needs one file size free), `--keep` keeps the files. Timings are warm page cache unless a row says cold. Other processes add noise: the output shows the load average.
+
+`bench_gui.py` measures the GUI paths (plot update and paint, full view and 1000x zoom, values table page) with a 16 x 2M sample file. Run it once per Qt binding:
+
+```bash
+QT_QPA_PLATFORM=offscreen PYQTGRAPH_QT_LIB=PySide6 python3 bench/bench_gui.py
+QT_QPA_PLATFORM=offscreen PYQTGRAPH_QT_LIB=PyQt5 python3 bench/bench_gui.py
+```

@@ -22,17 +22,28 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from PySide6.QtCore import (
+from pyqtgraph.Qt.QtCore import (
     QAbstractTableModel, QItemSelection, QItemSelectionModel, QModelIndex, QSortFilterProxyModel, Qt, QTimer,
     Signal,
 )
-from PySide6.QtGui import QColor, QFontMetrics, QGuiApplication, QKeySequence
-from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QMenu, QTableView
+from pyqtgraph.Qt.QtGui import QColor, QFontMetrics, QGuiApplication, QKeySequence
+from pyqtgraph.Qt.QtWidgets import QAbstractItemView, QHeaderView, QMenu, QTableView
 
 from . import theme
 from .formatting import format_si, format_value
 from .pyramid import Stats
 from .tdmsfile import KIND_COMPLEX, KIND_TIME, ChannelInfo
+
+# Qt enums read once. The models answer about 8 roles per visible cell, and in
+# PySide6 each Qt.XxxRole lookup costs about 2 us (plain int compare: 30 ns).
+_DISPLAY, _EDIT, _TOOLTIP = int(Qt.DisplayRole), int(Qt.EditRole), int(Qt.ToolTipRole)
+_ALIGN, _FONT = int(Qt.TextAlignmentRole), int(Qt.FontRole)
+_BACKGROUND, _FOREGROUND = int(Qt.BackgroundRole), int(Qt.ForegroundRole)
+_TEXT_ROLES = (_DISPLAY, _TOOLTIP)  # tooltip: full text of a narrow cell
+_PROP_ROLES = (_DISPLAY, _EDIT)
+_HORIZONTAL, _VERTICAL = Qt.Horizontal, Qt.Vertical
+_LEFT = int(Qt.AlignLeft | Qt.AlignVCenter)
+_RIGHT = int(Qt.AlignRight | Qt.AlignVCenter)
 
 MAX_ROWS = 2**31 - 1
 WINDOW_PAD = 256  # extra rows cached above and below the visible rows
@@ -71,7 +82,6 @@ class ValuesModel(QAbstractTableModel):
         self.row_limit = MAX_ROWS  # set by ValuesView from its row height
         self.reader = None  # callable(cid, i0, i1) -> array or None
         self._cache: dict[int, tuple[int, np.ndarray]] = {}
-        self._align = Qt.AlignRight | Qt.AlignVCenter
         self._font = theme.mono_font()
         self._missing = QColor("#f4f4f4")
 
@@ -107,20 +117,20 @@ class ValuesModel(QAbstractTableModel):
     def columnCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self.channels)
 
-    def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if role == Qt.DisplayRole:
-            if orientation == Qt.Horizontal:
+    def headerData(self, section, orientation, role=_DISPLAY):
+        if role == _DISPLAY:
+            if orientation == _HORIZONTAL:
                 if 0 <= section < len(self.channels):
                     c = self.channels[section]
                     return f"{c.group}\n{c.name} [{section:02d}]"
                 return None
             return str(self.start + section)
-        if role == Qt.ToolTipRole and orientation == Qt.Horizontal and 0 <= section < len(self.channels):
+        if role == _TOOLTIP and orientation == _HORIZONTAL and 0 <= section < len(self.channels):
             c = self.channels[section]
             unit = f", unit {c.unit}" if c.unit else ""
             return f"{c.label}\n{c.length} samples, {c.dtype}{unit}"
-        if role == Qt.TextAlignmentRole and orientation == Qt.Vertical:
-            return int(Qt.AlignRight | Qt.AlignVCenter)
+        if role == _ALIGN and orientation == _VERTICAL:
+            return _RIGHT
         return None
 
     def value(self, row: int, col: int):
@@ -137,15 +147,15 @@ class ValuesModel(QAbstractTableModel):
                 return arr[k]
         return None
 
-    def data(self, index, role=Qt.DisplayRole):
-        if role in (Qt.DisplayRole, Qt.ToolTipRole):  # tooltip: full text of a narrow cell
+    def data(self, index, role=_DISPLAY):
+        if role in _TEXT_ROLES:  # tooltip: full text of a narrow cell
             v = self.value(index.row(), index.column())
             return None if v is None else format_value(v)
-        if role == Qt.TextAlignmentRole:
-            return int(self._align)
-        if role == Qt.FontRole:
+        if role == _ALIGN:
+            return _RIGHT
+        if role == _FONT:
             return self._font
-        if role == Qt.BackgroundRole:
+        if role == _BACKGROUND:
             col = index.column()
             if self.start + index.row() >= self.stops[col]:
                 return self._missing
@@ -354,8 +364,8 @@ class StatsModel(QAbstractTableModel):
     def columnCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(STATS_COLUMNS)
 
-    def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+    def headerData(self, section, orientation, role=_DISPLAY):
+        if role == _DISPLAY and orientation == _HORIZONTAL:
             return STATS_COLUMNS[section]
         return None
 
@@ -405,18 +415,18 @@ class StatsModel(QAbstractTableModel):
             return _difference(vals[0], vals[1], exact, fmt)
         return ""
 
-    def data(self, index, role=Qt.DisplayRole):
-        if role == Qt.DisplayRole:
+    def data(self, index, role=_DISPLAY):
+        if role == _DISPLAY:
             return self._cell(index.row(), index.column())
-        if role == Qt.ToolTipRole and index.column() >= _C_N:
+        if role == _TOOLTIP and index.column() >= _C_N:
             return self._cell(index.row(), index.column(), exact=True)
-        if role == Qt.ToolTipRole and index.column() in (1, 2):
+        if role == _TOOLTIP and index.column() in (1, 2):
             return self._cell(index.row(), index.column())
-        if role == Qt.TextAlignmentRole:
-            return int((Qt.AlignLeft if index.column() in (1, 2) else Qt.AlignRight) | Qt.AlignVCenter)
-        if role == Qt.FontRole and index.column() >= _C_N:
+        if role == _ALIGN:
+            return _LEFT if index.column() in (1, 2) else _RIGHT
+        if role == _FONT and index.column() >= _C_N:
             return self._font
-        if role == Qt.ForegroundRole and index.column() == 0:
+        if role == _FOREGROUND and index.column() == 0:
             return theme.plot_color(self.rows[index.row()][0])
         return None
 
@@ -465,15 +475,15 @@ class PropertyModel(QAbstractTableModel):
     def columnCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else 2
 
-    def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+    def headerData(self, section, orientation, role=_DISPLAY):
+        if role == _DISPLAY and orientation == _HORIZONTAL:
             return self.HEAD[section]
         return None
 
-    def data(self, index, role=Qt.DisplayRole):
-        if role in (Qt.DisplayRole, Qt.EditRole):
+    def data(self, index, role=_DISPLAY):
+        if role in _PROP_ROLES:
             return self.items[index.row()][index.column()]
-        if role == Qt.ToolTipRole:
+        if role == _TOOLTIP:
             name, val, typ = self.items[index.row()]
             return f"{name} ({typ})\n{val}"
         return None

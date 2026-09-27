@@ -19,6 +19,8 @@ from tdms_builders import Obj, TdmsBuilder, obj_path
 from tdmsviewer import fastread
 from tdmsviewer.fastread import FastPathError, build_parts, make_fast_reader
 
+pytestmark = pytest.mark.usefixtures("read_path")  # POSIX and Windows read paths
+
 FAST_SCENARIOS = ("contiguous", "mixed", "extra_bytes", "chunks", "single_channel_chunks", "interleaved",
                   "interleaved_be", "big_endian", "all_dtypes", "raw_only", "growing", "waveform") + tuple(
     "truncated_" + m for m in tb.TRUNCATED_MODES)

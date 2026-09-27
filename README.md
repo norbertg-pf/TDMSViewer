@@ -1,8 +1,9 @@
 # TDMS Viewer
 
-Fast, read-only viewer for NI TDMS files on Ubuntu. It has the functions
-of the NI "TDMS File Viewer" and adds tools for fast analysis. It is
-free and open source (Python, Qt).
+Fast, read-only viewer for NI TDMS files on Ubuntu and Windows. It has the
+functions of the NI "TDMS File Viewer" and adds tools for fast analysis. It is
+free and open source (Python, Qt). DAQ Universal starts it from its toolbar
+(git submodule `external/TDMSViewer`).
 
 Run from the source folder, in its own virtual environment (`.venv`):
 
@@ -14,6 +15,17 @@ python3 main.py              # later: main.py uses .venv automatically
 Without a virtual environment: `python3 -m pip install -r requirements.txt`,
 then `TDMSVIEWER_NO_VENV=1 python3 main.py`. An active virtual environment
 of your own is always used as it is.
+
+Windows (PowerShell, Python 3.10 or later):
+
+```powershell
+py -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+py main.py measurement.tdms    # main.py uses .venv automatically
+```
+
+Qt binding: PySide6 (default, `requirements.txt`) or PyQt5. The viewer uses
+the binding that pyqtgraph finds. `PYQTGRAPH_QT_LIB=PyQt5` selects one.
 
 Or install it for your user (command `tdmsviewer`, menu entry, double-click
 on `.tdms` files):
@@ -114,17 +126,20 @@ table in 1.4 s of it); plots and statistics stay at the same speed.
 - A file that is still being written is shown as it was at open. Use F5.
 - The graph shows the envelope (min/max) when zoomed out. Zoom in to see
   single samples (markers appear when points are far apart).
+- Windows has no `pread`: reads from several threads run one after the other
+  (seek + read). Reads are about 25 % slower than on Linux.
 
 ## Develop
 
 ```bash
-python3 -m pip install -e ".[test]"
+python3 -m pip install -e ".[pyside6,test]"          # or ".[pyqt5,test]"
 QT_QPA_PLATFORM=offscreen python3 -m pytest
+QT_QPA_PLATFORM=offscreen PYQTGRAPH_QT_LIB=PyQt5 python3 -m pytest   # the DAQ Universal binding
 python3 -m tdmsviewer file.tdms
 ```
 
-Dependencies: NumPy (BSD), npTDMS (LGPL-3.0), PySide6 (LGPL-3.0),
-pyqtgraph (MIT). The test suite passes with the oldest and the newest
+Dependencies: NumPy (BSD), npTDMS (LGPL-3.0), pyqtgraph (MIT), and one Qt
+binding: PySide6 (LGPL-3.0) or PyQt5 (GPL-3.0). The test suite passes with the oldest and the newest
 allowed versions: NumPy 1.26 and 2.4, npTDMS 1.11, PySide6 6.8 and 6.11,
 pyqtgraph 0.13.7 and 0.14. npTDMS and pyqtgraph are capped below their next
 minor version, because the viewer uses their internals.

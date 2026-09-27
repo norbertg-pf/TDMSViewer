@@ -8,7 +8,7 @@ import os
 import numpy as np
 import pytest
 from nptdms import ChannelObject, GroupObject, TdmsWriter
-from PySide6.QtCore import Qt
+from pyqtgraph.Qt.QtCore import Qt
 
 pytest.importorskip("pytestqt")
 
@@ -40,7 +40,7 @@ def gui_file(tmp_path):
 
 @pytest.fixture
 def win(qtbot, tmp_path):
-    from PySide6.QtCore import QSettings
+    from pyqtgraph.Qt.QtCore import QSettings
 
     for fmt in (QSettings.NativeFormat, QSettings.IniFormat):
         QSettings.setPath(fmt, QSettings.UserScope, str(tmp_path / "cfg"))
@@ -154,11 +154,11 @@ def test_values_table_and_copy(qtbot, win, gui_file):
     assert m.data(m.index(5, 1)) == "s5"
     assert m.data(m.index(200, 1)) is None  # string channel has 100 values
     sel = win.values_view.selectionModel()
-    from PySide6.QtCore import QItemSelection, QItemSelectionModel
+    from pyqtgraph.Qt.QtCore import QItemSelection, QItemSelectionModel
 
     sel.select(QItemSelection(m.index(2, 0), m.index(3, 1)), QItemSelectionModel.Select)
     win._copy_values()
-    from PySide6.QtGui import QGuiApplication
+    from pyqtgraph.Qt.QtGui import QGuiApplication
 
     qtbot.waitUntil(lambda: QGuiApplication.clipboard().text() == "2\ts2\n3\ts3", timeout=5000)
 
@@ -217,8 +217,8 @@ def test_real_sample_file(qtbot, win):
 
 
 def test_legend_styles_and_zoom_about_point(qtbot, win, gui_file):
-    from PySide6.QtCore import QPointF
-    from PySide6.QtGui import QColor
+    from pyqtgraph.Qt.QtCore import QPointF
+    from pyqtgraph.Qt.QtGui import QColor
 
     from tdmsviewer.plotpanel import STYLE_BOTH, STYLE_POINTS, TOOL_ZOOMPT
 

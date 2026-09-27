@@ -399,7 +399,7 @@ def _valid_prefix(fd: int, size: int) -> int:
     """
     pos = 0
     while pos + _LEAD_IN <= size:
-        lead = os.pread(fd, _LEAD_IN, pos)
+        lead = fastread.pread(fd, _LEAD_IN, pos)
         if len(lead) < _LEAD_IN or lead[:4] != b"TDSm":
             break
         toc = struct.unpack_from("<l", lead, 4)[0]
@@ -710,7 +710,7 @@ class TdmsSource:
         self._fast: list = []
         if use_fast_path:
             try:
-                self._fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+                self._fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0))
             except OSError:
                 self._fd = -1
         self.model = self._build_model(size, index_used)
@@ -820,7 +820,7 @@ class TdmsSource:
         try:
             with open(self.path, "rb", buffering=0) as fh, open(self.path + "_index", "rb", buffering=0) as ih:
                 fd, ifd = fh.fileno(), ih.fileno()
-                if end < size and (os.pread(fd, 4, end) == b"TDSm" or _valid_prefix(fd, size) != end):
+                if end < size and (fastread.pread(fd, 4, end) == b"TDSm" or _valid_prefix(fd, size) != end):
                     return False
                 off = 0  # position of the segment in the index file
                 for i, seg in enumerate(segs):
@@ -1044,8 +1044,8 @@ def _ext_view(a: np.ndarray) -> np.ndarray:
 
 def _segment_matches(seg, fd: int, ifd: int, off: int, head: int, end: int) -> bool:
     """True if lead-in and metadata of one segment are the same in data and index file."""
-    data = os.pread(fd, head, seg.position)
-    idx = os.pread(ifd, head, off)
+    data = fastread.pread(fd, head, seg.position)
+    idx = fastread.pread(ifd, head, off)
     if len(data) != head or len(idx) != head or head < _LEAD_IN:
         return False
     if data[:4] != b"TDSm" or idx[:4] != b"TDSh" or data[4:] != idx[4:]:

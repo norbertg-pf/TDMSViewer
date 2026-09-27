@@ -12,11 +12,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("file", nargs="?", help="TDMS file to open")
     args, qt_args = parser.parse_known_args(argv)
 
-    from PySide6.QtWidgets import QApplication
+    from pyqtgraph.Qt import QT_LIB
+    from pyqtgraph.Qt.QtCore import Qt
+    from pyqtgraph.Qt.QtWidgets import QApplication
 
     # GUI and engine threads share the GIL: switch more often (default 5 ms).
     sys.setswitchinterval(0.002)
 
+    if QT_LIB in ("PyQt5", "PySide2"):  # Qt 6 does this by default
+        QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication([sys.argv[0], *qt_args])
     app.setApplicationName("TDMS Viewer")
     app.setOrganizationName("tdmsviewer")
@@ -25,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
         app.setStyle("Fusion")
     import os
 
-    from PySide6.QtGui import QIcon
+    from pyqtgraph.Qt.QtGui import QIcon
 
     app.setWindowIcon(QIcon(os.path.join(os.path.dirname(__file__), "icon.svg")))
 

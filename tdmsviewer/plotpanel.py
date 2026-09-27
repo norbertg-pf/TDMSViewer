@@ -31,16 +31,16 @@ from dataclasses import dataclass
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
-from PySide6.QtWidgets import (
+from pyqtgraph.Qt.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
+from pyqtgraph.Qt.QtGui import QAction, QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from pyqtgraph.Qt.QtWidgets import (
     QAbstractItemView, QButtonGroup, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMenu,
     QSplitter, QToolButton, QVBoxLayout, QWidget,
 )
 
 from . import theme
 from .formatting import format_duration, format_si
-from .xaxis import FMT_ABSOLUTE, FMT_NUMBER, FMT_RELATIVE, TimeAxisItem, TimeRef
+from .xaxis import FMT_ABSOLUTE, FMT_NUMBER, FMT_RELATIVE, GridAxisItem, TimeAxisItem, TimeRef
 
 TOOL_ZOOM, TOOL_ZOOMX, TOOL_ZOOMY, TOOL_PAN = "zoom", "zoomx", "zoomy", "pan"
 TOOL_ZOOMPT = "zoompt"  # click: zoom in 2x about the point, Shift+click: zoom out
@@ -307,7 +307,7 @@ class PlotPanel(QWidget):
 
         self.vb = GraphViewBox()
         self.xaxis = TimeAxisItem("bottom")
-        self.plot = pg.PlotWidget(viewBox=self.vb, axisItems={"bottom": self.xaxis})
+        self.plot = pg.PlotWidget(viewBox=self.vb, axisItems={"bottom": self.xaxis, "left": GridAxisItem("left")})
         pi = self.plot.getPlotItem()
         # No "Plot Options" menu: its transforms (log, FFT, ...) change the axes
         # but not the decimated data, so values read off the axes would be wrong.
@@ -315,6 +315,8 @@ class PlotPanel(QWidget):
         self._hide_mouse_mode_menu()
         pi.hideButtons()
         pi.showGrid(x=True, y=True, alpha=theme.GRID_ALPHA)
+        for name in ("bottom", "left"):
+            pi.getAxis(name).behind_curves()
         pi.getAxis("left").enableAutoSIPrefix(False)
         pi.getAxis("left").setWidth(72)
         self.plot.setMinimumSize(300, 150)
@@ -942,7 +944,7 @@ class PlotPanel(QWidget):
         m.exec(self.legend.mapToGlobal(pos))
 
     def _pick_color(self, cids) -> None:
-        from PySide6.QtWidgets import QColorDialog
+        from pyqtgraph.Qt.QtWidgets import QColorDialog
 
         start = self._styles[cids[0]]["color"] if cids and cids[0] in self._styles else QColor("#000")
         col = QColorDialog.getColor(start, self, "Plot color")

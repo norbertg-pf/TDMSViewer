@@ -10,8 +10,8 @@ import time
 import numpy as np
 import pytest
 from nptdms import ChannelObject, TdmsWriter
-from PySide6.QtCore import QItemSelection, QItemSelectionModel, QMimeData, QPointF, Qt, QUrl
-from PySide6.QtGui import QDropEvent, QFontMetrics, QGuiApplication
+from pyqtgraph.Qt.QtCore import QItemSelection, QItemSelectionModel, QMimeData, QPointF, Qt, QUrl
+from pyqtgraph.Qt.QtGui import QDropEvent, QFontMetrics, QGuiApplication
 
 pytest.importorskip("pytestqt")
 
@@ -374,7 +374,9 @@ def test_legend_uses_group_for_same_names(qtbot, win, same_names_file):
 # -- 12: graph keys only in the graph --------------------------------------------------------
 
 def test_graph_keys_do_not_fire_in_combo_boxes(qtbot, win, gui_file):
-    from PySide6.QtTest import QTest
+    from pyqtgraph.Qt import QtTest
+
+    QTest = QtTest.QTest
 
     _open(qtbot, win, gui_file)
     keys = {a.shortcut().toString() for a in win.plot.plot.actions()}

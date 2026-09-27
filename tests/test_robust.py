@@ -25,6 +25,8 @@ from tdms_builders import Obj, Prop, TdmsBuilder, obj_path
 from tdmsviewer import tdmsfile
 from tdmsviewer.tdmsfile import KIND_FLOAT, KIND_TIME, TdmsSource, tdms_time_to_ns
 
+pytestmark = pytest.mark.usefixtures("read_path")  # POSIX and Windows read paths
+
 NON_UTF8 = "Some names or strings are not UTF-8; they were decoded as Windows-1252."
 
 
