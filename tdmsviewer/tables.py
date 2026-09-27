@@ -3,8 +3,17 @@
 Summary
     ValuesModel is lazy. It keeps only a window of rows around the
     visible area. RAM and fast-path channels are read at once; other
-    channels are read by the engine and filled in when ready. Qt handles
-    up to 2**31 - 1 rows with this model at ~10 MB memory.
+    channels are read by the engine and filled in when ready.
+
+Row limit
+    Qt keeps the length of the vertical header in pixels as a 32-bit
+    int. Above (2**31 - 1) / row height rows (about 119M rows at 18 px)
+    the GUI thread hangs inside QHeaderView. ValuesView gives the model
+    this limit; the model shows only the first rows from Start index.
+
+Numbers
+    Cells elide on the left ("…708e-05"), never on the right: a cut
+    number must not look like another value ("-2…" for -2.1e-05).
 """
 
 from __future__ import annotations
@@ -13,18 +22,38 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QGuiApplication, QKeySequence
+from PySide6.QtCore import (
+    QAbstractTableModel, QItemSelection, QItemSelectionModel, QModelIndex, QSortFilterProxyModel, Qt, QTimer,
+    Signal,
+)
+from PySide6.QtGui import QColor, QFontMetrics, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QMenu, QTableView
 
 from . import theme
 from .formatting import format_si, format_value
 from .pyramid import Stats
-from .tdmsfile import ChannelInfo
+from .tdmsfile import KIND_COMPLEX, KIND_TIME, ChannelInfo
 
 MAX_ROWS = 2**31 - 1
 WINDOW_PAD = 256  # extra rows cached above and below the visible rows
 COPY_MAX_CELLS = 2_000_000
+# Widest texts of a full-precision value, per kind (for the column width).
+WIDEST_FLOAT = "-2.2250738585072014e-308"
+WIDEST_TEXT = {
+    KIND_TIME: "2026-07-28 10:05:36.000000123+14:00",
+    KIND_COMPLEX: "-2.2250738585072014e-308-2.2250738585072014e-308j",
+}
+CELL_PAD = 16  # cell margins, grid line and a small reserve (pixels)
+
+
+def max_table_rows(row_height: int) -> int:
+    """Largest row count whose header length in pixels fits a 32-bit int."""
+    return (2**31 - 1) // max(1, int(row_height)) - 1
+
+
+def text_width(text: str, font=None) -> int:
+    """Column width (pixels) that shows `text` without eliding (default: value font)."""
+    return QFontMetrics(font if font is not None else theme.mono_font()).horizontalAdvance(text) + CELL_PAD
 
 
 class ValuesModel(QAbstractTableModel):
@@ -38,11 +67,18 @@ class ValuesModel(QAbstractTableModel):
         self.start = 0
         self.stops: list[int] = []
         self.rows = 0
+        self.total_rows = 0  # rows before the row limit
+        self.row_limit = MAX_ROWS  # set by ValuesView from its row height
         self.reader = None  # callable(cid, i0, i1) -> array or None
         self._cache: dict[int, tuple[int, np.ndarray]] = {}
         self._align = Qt.AlignRight | Qt.AlignVCenter
         self._font = theme.mono_font()
         self._missing = QColor("#f4f4f4")
+
+    @property
+    def clamped(self) -> bool:
+        """True if the table shows fewer rows than the range has."""
+        return self.total_rows > self.rows
 
     def set_channels(self, channels: list[ChannelInfo], start: int, count: int | None) -> None:
         self.beginResetModel()
@@ -55,7 +91,8 @@ class ValuesModel(QAbstractTableModel):
             stop = max(self.start, stop)
             self.stops.append(stop)
             rows = max(rows, stop - self.start)
-        self.rows = min(MAX_ROWS, rows)
+        self.total_rows = rows
+        self.rows = min(MAX_ROWS, self.row_limit, rows)
         self._cache.clear()
         self.endResetModel()
 
@@ -101,7 +138,7 @@ class ValuesModel(QAbstractTableModel):
         return None
 
     def data(self, index, role=Qt.DisplayRole):
-        if role == Qt.DisplayRole:
+        if role in (Qt.DisplayRole, Qt.ToolTipRole):  # tooltip: full text of a narrow cell
             v = self.value(index.row(), index.column())
             return None if v is None else format_value(v)
         if role == Qt.TextAlignmentRole:
@@ -170,12 +207,13 @@ class ValuesView(QTableView):
         self.setAlternatingRowColors(True)
         self.setWordWrap(False)
         self.setCornerButtonEnabled(False)
+        self.setTextElideMode(Qt.ElideLeft)
         vh = self.verticalHeader()
         vh.setSectionResizeMode(QHeaderView.Fixed)
         vh.setDefaultSectionSize(max(18, self.fontMetrics().height() + 4))
         vh.setMinimumWidth(56)
         hh = self.horizontalHeader()
-        hh.setDefaultSectionSize(190)
+        hh.setDefaultSectionSize(text_width(WIDEST_FLOAT))
         hh.setMinimumSectionSize(60)
         hh.setDefaultAlignment(Qt.AlignCenter)
         self._timer = QTimer(self)
@@ -186,9 +224,53 @@ class ValuesView(QTableView):
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._menu)
 
+    def max_rows(self) -> int:
+        """Row limit of this view (header length in pixels must fit an int32)."""
+        return max_table_rows(self.verticalHeader().defaultSectionSize())
+
     def setModel(self, model):
         super().setModel(model)
+        model.row_limit = self.max_rows()
         model.modelReset.connect(self._schedule)
+        model.modelReset.connect(self._set_widths)
+        self._detach_headers()
+
+    def setSelectionModel(self, sel):
+        super().setSelectionModel(sel)
+        self._detach_headers()
+
+    def _detach_headers(self) -> None:
+        """Give the headers their own empty selection model.
+
+        A header asks isColumnSelected() for every painted section. Qt
+        answers it with one flags() call per selected row, so a selection
+        of millions of rows (Ctrl+A) blocks each repaint for many seconds.
+        Without the table selection the headers do not highlight
+        selected sections; selecting by header click still works.
+        """
+        m, sel = self.model(), self.selectionModel()
+        if m is None:
+            return
+        for h in (self.horizontalHeader(), self.verticalHeader()):
+            hs = h.selectionModel()
+            if hs is None or hs is sel or hs.model() is not m:
+                h.setSelectionModel(QItemSelectionModel(m, h))
+
+    def _set_widths(self) -> None:
+        """Column widths that show a full-precision value of the column kind."""
+        m = self.model()
+        for col, c in enumerate(getattr(m, "channels", [])):
+            txt = WIDEST_TEXT.get(c.kind)
+            if txt is not None:
+                self.setColumnWidth(col, text_width(txt))
+
+    def selectAll(self):
+        """Select all cells as one range (cheap for any row count)."""
+        m, sel = self.model(), self.selectionModel()
+        if m is None or sel is None or m.rowCount() == 0 or m.columnCount() == 0:
+            return
+        sel.select(QItemSelection(m.index(0, 0), m.index(m.rowCount() - 1, m.columnCount() - 1)),
+                   QItemSelectionModel.ClearAndSelect)
 
     def _schedule(self, *a):
         self._timer.start()
@@ -246,6 +328,7 @@ class StatsModel(QAbstractTableModel):
         super().__init__(parent)
         self.rows: list[tuple[int, ChannelInfo]] = []
         self.values: dict[int, dict] = {}
+        self.units: dict[int, str] = {}  # unit text per channel id (default: channel unit)
         self._font = theme.mono_font()
 
     def set_channels(self, rows: list[tuple[int, ChannelInfo]]) -> None:
@@ -253,6 +336,12 @@ class StatsModel(QAbstractTableModel):
         self.rows = [(n, c) for n, c in rows if c.plottable]
         self.values = {}
         self.endResetModel()
+
+    def set_units(self, units: dict[int, str]) -> None:
+        """Unit column text, for example "|z|" for complex values."""
+        self.units = dict(units)
+        if self.rows:
+            self.dataChanged.emit(self.index(0, 2), self.index(len(self.rows) - 1, 2))
 
     def put(self, values: dict) -> None:
         self.values = values
@@ -277,7 +366,7 @@ class StatsModel(QAbstractTableModel):
         if col == 1:
             return c.label
         if col == 2:
-            return c.unit
+            return self.units.get(c.id, c.unit)
         res = self.values.get(c.id)
         if res is None:
             return ""
@@ -321,6 +410,8 @@ class StatsModel(QAbstractTableModel):
             return self._cell(index.row(), index.column())
         if role == Qt.ToolTipRole and index.column() >= _C_N:
             return self._cell(index.row(), index.column(), exact=True)
+        if role == Qt.ToolTipRole and index.column() in (1, 2):
+            return self._cell(index.row(), index.column())
         if role == Qt.TextAlignmentRole:
             return int((Qt.AlignLeft if index.column() in (1, 2) else Qt.AlignRight) | Qt.AlignVCenter)
         if role == Qt.FontRole and index.column() >= _C_N:
@@ -395,22 +486,52 @@ class PropertyFilter(QSortFilterProxyModel):
         self.setFilterKeyColumn(-1)
 
 
-def copy_selection(view: QTableView, value_of) -> str:
-    """TSV text of the selected cells. value_of(row, col) -> text."""
+def selection_ranges(view: QTableView) -> list[tuple[int, int, int, int]]:
+    """Selected ranges (top, bottom, left, right), inclusive.
+
+    Uses the selection ranges only. selectedIndexes() makes one Python
+    object per cell (GBs of RAM and minutes for a Ctrl+A of millions of rows).
+    """
     sel = view.selectionModel()
     if sel is None:
+        return []
+    return [(r.top(), r.bottom(), r.left(), r.right()) for r in sel.selection() if r.isValid()]
+
+
+def selection_grid(ranges) -> tuple[list[tuple[int, int]], list[int]]:
+    """Merged row intervals [r0, r1) and the sorted columns of the ranges."""
+    rows: list[tuple[int, int]] = []
+    for a, b in sorted((t, bt + 1) for t, bt, _, _ in ranges):
+        if rows and a <= rows[-1][1]:
+            rows[-1] = (rows[-1][0], max(rows[-1][1], b))
+        else:
+            rows.append((a, b))
+    cols = sorted({c for _, _, left, right in ranges for c in range(left, right + 1)})
+    return rows, cols
+
+
+def copy_selection(view: QTableView, value_of, ranges=None, column_texts=None) -> str:
+    """TSV text of the selected cells. value_of(row, col) -> text.
+
+    column_texts(col, r0, r1) -> list of texts: optional fast path for
+    one rectangular selection.
+    """
+    if ranges is None:
+        ranges = selection_ranges(view)
+    if not ranges:
         return ""
-    idx = sel.selectedIndexes()
-    if not idx:
+    rows, cols = selection_grid(ranges)
+    if sum(b - a for a, b in rows) * len(cols) > COPY_MAX_CELLS:
         return ""
-    rows = sorted({i.row() for i in idx})
-    cols = sorted({i.column() for i in idx})
-    if len(rows) * len(cols) > COPY_MAX_CELLS:
-        return ""
-    chosen = {(i.row(), i.column()) for i in idx}
+    if len(ranges) == 1 and column_texts is not None:
+        (r0, r1), = rows
+        return "\n".join("\t".join(t) for t in zip(*(column_texts(c, r0, r1) for c in cols)))
     lines = []
-    for r in rows:
-        lines.append("\t".join(value_of(r, c) if (r, c) in chosen else "" for c in cols))
+    for a, b in rows:
+        for r in range(a, b):
+            hit = [(left, right) for t, bt, left, right in ranges if t <= r <= bt]
+            lines.append("\t".join(value_of(r, c) if any(left <= c <= right for left, right in hit) else ""
+                                   for c in cols))
     return "\n".join(lines)
 
 
