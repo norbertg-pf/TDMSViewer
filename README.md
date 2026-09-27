@@ -63,6 +63,28 @@ If Qt reports a missing `xcb` plugin, install the system libraries:
 | Properties | NI order (ASCII sort), NI_ChannelLength, NI_DataType, filter box |
 | Export | Ctrl+E: visible range as CSV (full resolution); graph image: right-click > Export |
 
+## Performance
+
+512 MB file (16 channels x 4M float64 samples, 500 segments), warm page
+cache, 4-core Xeon 2.1 GHz. Naive = npTDMS `TdmsFile.read` + NumPy min/max.
+Full table: `bench/bench_engine.py`.
+
+| Operation | TDMS Viewer | Naive | Gain |
+|---|---|---|---|
+| Open (metadata, checks) | 49 ms | - | - |
+| First full plot | 117 ms | 2008 ms | 17x |
+| Plot full view (2000 px, all channels) | 9.7 ms | 83 ms | 9x |
+| Statistics, full range, all channels | 0.86 ms | 253 ms | 290x |
+| Read 4096 samples of one channel | 15 us | 66 us | 4x |
+| Load all channels (RAM mode) | 0.4 s | 1.9 s | 5x |
+
+A file with 20 000 segments opens in 1.5 s (npTDMS parses the segment
+table in 1.4 s of it); plots and statistics stay at the same speed.
+
+![File with all channels](docs/screenshot_file.png)
+![Group, cursors and statistics](docs/screenshot_cursors_statistics.png)
+![Time channel as X axis](docs/screenshot_time_channel_x.png)
+
 ## How it is fast
 
 1. **Metadata only at open.** Channel data loads in the background.

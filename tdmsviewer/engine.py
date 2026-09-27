@@ -35,6 +35,8 @@ from .xaxis import ArrayMap, LinearMap, TimeRef, is_monotonic
 
 BLOCK = 1 << 22  # samples per load step
 FAMILY_STEP_BYTES = 32 << 20  # bytes per load step when channels load together
+FAMILY_READ_MIN = 1 << 15  # plot: raw reads from this size read the channel family in one pass
+FAMILY_READ_MAX = 1 << 25  # plot: max samples of one family read (all channels)
 PYR_BASE_RAM = 256
 PYR_MIN_LEN = 4096  # no pyramid below this length (raw decimation is cheap)
 RAW_DECIMATE_MAX = 1 << 24  # max raw samples for statistics on demand
@@ -244,6 +246,8 @@ class DataEngine(QObject):
         self._builds: list = []  # helper-thread futures of the current file
         self._raw_budget = RAW_PLOT_BUDGET
         self._xy_points = XY_MAX_POINTS
+        self._plot_req = None  # (request, pixels) while a plot request runs
+        self._prefetched: dict = {}  # cid -> (i0, i1, values), this plot request only
         self._file_stat = None  # (size, mtime, inode) at open: detect a rewrite
         self._file_warned = False
         self._stat_checked = 0.0
@@ -752,7 +756,44 @@ class DataEngine(QObject):
     def _read(self, st: _Store, i0: int, i1: int) -> np.ndarray:
         if st.ram is not None:
             return st.ram[max(0, i0):max(0, i1)]
+        pf = self._prefetched.get(st.info.id)
+        if pf is None and self._plot_req is not None and i1 - i0 >= FAMILY_READ_MIN:
+            self._read_family(st, i0, i1)
+            pf = self._prefetched.get(st.info.id)
+        if pf is not None and pf[0] <= max(0, i0) and min(i1, st.info.length) <= pf[1]:
+            return pf[2][max(0, i0) - pf[0]:min(i1, st.info.length) - pf[0]]
         return self._source.read(st.info.id, i0, i1)
+
+    def _read_family(self, st: _Store, i0: int, i1: int) -> None:
+        """Plot of a fragmented disk channel: read [i0, i1) of the channels of its
+        family that this request needs in the same range, in one file pass.
+
+        Only loaded channels (each takes the same raw path). No read if no
+        other channel needs this range.
+        """
+        f = st.fast
+        if f is None or not f.fragmented or not st.done:
+            return
+        req, _px = self._plot_req
+        group = [st]
+        for it in req.items:
+            o = self._store(it.cid)
+            if (o is None or o in group or o.ram is not None or o.fast is None or not o.done
+                    or o.fast.family != f.family or not o.info.plottable or it.cid in self._prefetched
+                    or (isinstance(it.xmap, ArrayMap) and not it.xmap.monotonic)):
+                continue
+            e = min(it.e, o.info.length)
+            if isinstance(it.xmap, ArrayMap):
+                e = min(e, it.xmap.x.size)
+            if it.xmap.index_range(req.xa, req.xb, it.s, e) == (i0, i1):
+                if (len(group) + 1) * (i1 - i0) > FAMILY_READ_MAX:
+                    break
+                group.append(o)
+        if len(group) < 2:
+            return
+        a, b = max(0, i0), min(i1, f.length)
+        for o, arr in zip(group, fastread.read_many([o.fast for o in group], a, b)):
+            self._prefetched[o.info.id] = (a, b, arr)
 
     def _read_f64(self, st: _Store, i0: int, i1: int) -> np.ndarray:
         """float64 values; timestamps and int64/uint64 relative to st.t0."""
@@ -776,8 +817,16 @@ class DataEngine(QObject):
     # -- plot -----------------------------------------------------------------------
 
     def _do_plot(self, gen: int, req: PlotRequest) -> None:
-        out = {}
         px = max(16, int(req.pixels))
+        self._plot_req = (req, px)
+        try:
+            self._do_plot_items(gen, req, px)
+        finally:
+            self._plot_req = None
+            self._prefetched = {}
+
+    def _do_plot_items(self, gen: int, req: PlotRequest, px: int) -> None:
+        out = {}
         self._raw_budget = RAW_PLOT_BUDGET
         # X-Y plots: one point budget for the whole request, not per channel.
         n_xy = sum(1 for it in req.items if isinstance(it.xmap, ArrayMap) and not it.xmap.monotonic)

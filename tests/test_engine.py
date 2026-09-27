@@ -1732,3 +1732,36 @@ def test_iso_times_exact_to_ns():
                    "2026-07-28T10:05:37.000000000Z", "2026-07-28T11:05:36.750000000Z",
                    "2026-07-28T10:05:36.000000000Z", "", "", ""]
     assert iso_times(ref, np.empty(0)) == []
+
+
+def test_disk_plot_reads_fragmented_family_once(new_driver, tmp_path, monkeypatch):
+    """Disk mode, raw zoom level: 3 channels of one family, one read_many for the request."""
+    from nptdms import ChannelObject, TdmsWriter
+
+    from tdmsviewer import fastread
+
+    monkeypatch.setenv("TDMSVIEWER_RAM_MB", "0")
+    rng = np.random.default_rng(11)
+    n_seg, npc = 700, 100
+    data = {nm: rng.normal(size=n_seg * npc) for nm in ("a", "b", "c")}
+    data["b"][40_004] = 1e6  # spike inside the plotted range
+    path = tmp_path / "frag_disk.tdms"
+    with TdmsWriter(str(path)) as w:
+        for k in range(n_seg):
+            w.write_segment([ChannelObject("G", nm, v[k * npc:(k + 1) * npc]) for nm, v in data.items()])
+    drv = new_driver()
+    drv.open(path)
+    calls = []
+    orig = fastread.read_many
+    monkeypatch.setattr(fastread, "read_many", lambda rs, a, b, outs=None: (calls.append((len(rs), a, b)),
+                                                                          orig(rs, a, b, outs))[1])
+    xm = LinearMap(0.0, 1.0)
+    n = n_seg * npc
+    ids = [st.info.id for st in drv.eng._stores]
+    xa, xb, px = 1000.0, 61_000.0, 1500  # ~60000 samples: below pyramid resolution -> raw read
+    res = drv.plot([PlotItem(cid, xm, 0, n) for cid in ids], xa, xb, px)
+    assert calls == [(3, 999, 61_002)]  # index_range adds one sample on each side
+    for st in drv.eng._stores:
+        check_plot(res[st.info.id], data[st.info.name], xm, xa, xb, px)
+    assert np.nanmax(res[ids[1]][1]) == 1e6
+    assert drv.eng._prefetched == {} and drv.eng._plot_req is None

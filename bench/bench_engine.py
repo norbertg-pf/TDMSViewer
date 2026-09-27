@@ -285,7 +285,7 @@ def bench_read(spec: Spec, tab: Table, args, rng) -> np.ndarray | None:
         a, b = fast.read(0, n), np.asarray(ch.read_data(0, n))
         if a.dtype != b.dtype or a.tobytes() != b.tobytes():
             spec.notes.append(f"BUG? fast read of {info.label} differs from npTDMS")
-        tab.put(col, "rd_parts", str(len(getattr(fast, "_parts", ())) or "?"))
+        tab.put(col, "rd_parts", str(getattr(fast, "n_parts", "?")) + (", fragmented" if getattr(fast, "fragmented", False) else ""))
         tab.put(col, "rd_full_fast", f"{fnum(1e3 * min(t_fast))} ({fnum(nbytes / min(t_fast) / 1e9)} GB/s)")
         tab.put(col, "rd_full_np", f"{fnum(1e3 * min(t_np))} ({fnum(nbytes / min(t_np) / 1e9)} GB/s)")
         del b
