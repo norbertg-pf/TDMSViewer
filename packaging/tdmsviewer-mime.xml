@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-tdms">
+    <comment>NI TDMS data file</comment>
+    <magic priority="60"><match type="string" offset="0" value="TDSm"/></magic>
+    <glob pattern="*.tdms"/>
+  </mime-type>
+</mime-info>
