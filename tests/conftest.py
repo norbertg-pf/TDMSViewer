@@ -16,6 +16,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
+from pyqtgraph.Qt import QT_LIB  # noqa: E402
+
+# pytest-qt must use the binding that pyqtgraph picked (set PYQTGRAPH_QT_LIB
+# to test another one, for example PyQt5).
+os.environ.setdefault("PYTEST_QT_API", QT_LIB.lower())
 
 TESTS_DIR = Path(__file__).resolve().parent
 for _p in (str(TESTS_DIR), str(TESTS_DIR.parent)):
@@ -106,3 +111,18 @@ def set_tz():
     else:
         os.environ["TZ"] = old
     time.tzset()
+
+
+@pytest.fixture(params=["pread", "seek"])
+def read_path(request, monkeypatch) -> str:
+    """Run a test with both positional read paths.
+
+    "pread" is the POSIX path. "seek" is the Windows path (locked seek + read):
+    Linux has pread, so the test forces it here.
+    """
+    if request.param == "seek":
+        from tdmsviewer import fastread
+
+        monkeypatch.setattr(fastread, "_readinto_at", fastread._seek_readinto)
+        monkeypatch.setattr(fastread, "pread", fastread._seek_pread)
+    return request.param

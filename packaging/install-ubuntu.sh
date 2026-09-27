@@ -36,7 +36,7 @@ fi
 
 python3 -m venv "${VENV}"
 "${VENV}/bin/python" -m pip install --upgrade pip >/dev/null
-"${VENV}/bin/python" -m pip install "${SRC}"
+"${VENV}/bin/python" -m pip install "${SRC}[pyside6]"
 
 mkdir -p "${BIN}" "${APPS}" "${ICONS}" "${MIME}/packages"
 ln -sf "${VENV}/bin/tdmsviewer" "${BIN}/tdmsviewer"

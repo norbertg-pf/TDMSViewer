@@ -40,9 +40,9 @@ if str(ROOT) not in sys.path:
 
 import numpy as np  # noqa: E402
 import nptdms  # noqa: E402
-import PySide6  # noqa: E402
 from nptdms import ChannelObject, GroupObject, RootObject, TdmsFile, TdmsWriter  # noqa: E402
-from PySide6.QtCore import QCoreApplication, QEventLoop, QTimer  # noqa: E402
+from pyqtgraph.Qt import VERSION_INFO  # noqa: E402
+from pyqtgraph.Qt.QtCore import QCoreApplication, QEventLoop, QTimer  # noqa: E402
 
 from tdmsviewer import engine as engmod  # noqa: E402
 from tdmsviewer import pyramid as pyr  # noqa: E402
@@ -906,7 +906,7 @@ def environment_text(args) -> str:
         pass
     mem = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
     return (f"Python {platform.python_version()}, numpy {np.__version__}, npTDMS {nptdms.__version__}, "
-            f"PySide6 {PySide6.__version__}; {os.cpu_count()} CPUs ({cpu}), {mem:.1f} GiB RAM. "
+            f"{VERSION_INFO}; {os.cpu_count()} CPUs ({cpu}), {mem:.1f} GiB RAM. "
             f"Engine RAM budget: {engmod.ram_budget_bytes() / 2**20:.0f} MiB (RAM mode), "
             f"1 MiB (disk mode). Page cache is warm unless a row says cold. "
             f"Package source hash {source_hash()}. Load average at start {args.loadavg}, "

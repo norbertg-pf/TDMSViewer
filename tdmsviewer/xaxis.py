@@ -175,7 +175,41 @@ _MINOR = {1: 0.2, 2: 0.5, 5: 1, 10: 2, 15: 5, 30: 5, 60: 10, 120: 30, 300: 60, 6
           43200: 7200, 86400: 21600}
 
 
-class TimeAxisItem(pg.AxisItem):
+class GridAxisItem(pg.AxisItem):
+    """Axis whose grid lines lie behind the curves, in opaque colors.
+
+    pyqtgraph draws the grid lines with alpha, above the curves. Qt 6 draws
+    semi-transparent lines about 25 times slower than opaque lines (1400 px
+    graph: 36 ms instead of 1.4 ms per paint). Each color is blended with the
+    background once, so the grid looks the same where there is no curve.
+    Call behind_curves() after the PlotItem is made (it sets z 0.5).
+    """
+
+    def behind_curves(self) -> None:
+        self.setZValue(-200)  # below the ViewBox (-100)
+
+    def generateDrawSpecs(self, p):
+        specs = super().generateDrawSpecs(p)
+        if specs is None or self.grid is False:
+            return specs
+        axis_spec, tick_specs, text_specs = specs
+        bg = pg.mkColor(pg.getConfigOption("background"))
+        return axis_spec, [(_opaque_pen(pen, bg), p1, p2) for pen, p1, p2 in tick_specs], text_specs
+
+
+def _opaque_pen(pen, bg):
+    """Copy of pen whose color is pen color over bg (alpha 255)."""
+    c = pen.color()
+    a = c.alphaF()
+    if a >= 1.0:
+        return pen
+    out = pg.QtGui.QPen(pen)
+    out.setColor(pg.QtGui.QColor(round(c.red() * a + bg.red() * (1 - a)), round(c.green() * a + bg.green() * (1 - a)),
+                                 round(c.blue() * a + bg.blue() * (1 - a))))
+    return out
+
+
+class TimeAxisItem(GridAxisItem):
     """Axis with number, relative time (HH:MM:SS.fff) or absolute time labels."""
 
     def __init__(self, orientation="bottom", **kw):

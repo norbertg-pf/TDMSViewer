@@ -26,7 +26,7 @@ import traceback
 from dataclasses import dataclass, field
 
 import numpy as np
-from PySide6.QtCore import QObject, Signal
+from pyqtgraph.Qt.QtCore import QObject, Signal
 
 from . import fastread
 from . import pyramid as pyr
@@ -63,8 +63,27 @@ def ram_budget_bytes() -> int:
         try:
             avail = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
         except (ValueError, OSError, AttributeError):
-            avail = 4 << 30
+            avail = _windows_available_ram() or 4 << 30
     return int(min(0.4 * avail, 16 << 30))
+
+
+def _windows_available_ram() -> int | None:
+    """Free physical memory in bytes (GlobalMemoryStatusEx), None if not Windows."""
+    if os.name != "nt":
+        return None
+    import ctypes
+
+    class _MemoryStatusEx(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_uint32), ("dwMemoryLoad", ctypes.c_uint32),
+                    *((name, ctypes.c_ulonglong) for name in (
+                        "ullTotalPhys", "ullAvailPhys", "ullTotalPageFile", "ullAvailPageFile",
+                        "ullTotalVirtual", "ullAvailVirtual", "ullAvailExtendedVirtual"))]
+
+    status = _MemoryStatusEx()
+    status.dwLength = ctypes.sizeof(status)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return None
+    return int(status.ullAvailPhys)
 
 
 def pyramid_bucket_budget() -> int:

@@ -18,6 +18,8 @@ from tdms_builders import Obj, Prop, TdmsBuilder, obj_path
 from tdmsviewer.tdmsfile import (KIND_BOOL, KIND_COMPLEX, KIND_EMPTY, KIND_FLOAT, KIND_INT, KIND_STRING,
                                  KIND_TIME, TdmsSource)
 
+pytestmark = pytest.mark.usefixtures("read_path")  # POSIX and Windows read paths
+
 G = tb.G
 
 DTYPE_KIND = {"f": KIND_FLOAT, "i": KIND_INT, "u": KIND_INT, "b": KIND_BOOL, "c": KIND_COMPLEX,
