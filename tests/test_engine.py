@@ -11,6 +11,7 @@ import csv
 import math
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1615,3 +1616,152 @@ def test_real_flexlogger_file(drv, tmp_path, monkeypatch, ram_mb):
     assert [float(r[2]) for r in rows] == data["PXIe-4303 (PXI2Slot3)/V0"][k0:k1].tolist()
     assert [float(r[5]) for r in rows] == T[k0:k1].tolist()
     assert drv.rec.of("message", gen) == []
+
+
+# -- robustness of answers ---------------------------------------------------------
+
+def test_x_task_error_is_answered(drv, small_file, monkeypatch):
+    """A read error while loading X values gives an xReady error text (GUI falls back)."""
+    gen, model = drv.open(small_file.path)
+
+    def broken(self, st, i0, i1):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(DataEngine, "_read_f64", broken)
+    res = drv.xmap(0)
+    assert isinstance(res, str) and "disk gone" in res
+
+
+def test_open_error_after_metadata_gives_open_failed(new_driver, small_file, monkeypatch):
+    """An error after the metadata is read still ends in openFailed (never stuck at 'Opening')."""
+    d = new_driver()
+
+    def bad_budget():
+        raise ValueError("could not convert string to float: '1,5'")
+
+    monkeypatch.setattr(eng_mod, "ram_budget_bytes", bad_budget)
+    gen = d.eng.open(str(small_file.path))
+    g, msg = d.wait("openFailed", lambda g, m: g == gen)
+    assert "1,5" in msg
+    assert d.eng._source is None  # the file is closed again
+
+
+def test_file_changed_on_disk_is_reported(drv, tmp_path):
+    """A rewrite of the open file gives one clear warning (display can mix versions)."""
+    path = tmp_path / "live.tdms"
+    write_segments(path, [[("G", "a", np.zeros(5000), {})]])
+    gen, model = drv.open(path)
+    time.sleep(0.6)
+    write_segments(path, [[("G", "a", np.ones(5000), {})]])  # same name, new content
+    items = [PlotItem(0, LinearMap(0.0, 1.0), 0, 5000)]
+    drv.plot(items, 0, 5000, 100)
+    msgs = [m for g, m in drv.rec.of("message") if g == gen]
+    assert any("changed on disk" in m for m in msgs), msgs
+    drv.plot(items, 0, 2500, 100)
+    time.sleep(0.6)
+    drv.plot(items, 0, 5000, 100)
+    msgs = [m for g, m in drv.rec.of("message") if g == gen and "changed on disk" in m]
+    assert len(msgs) == 1  # reported once
+
+
+def test_xy_point_budget_is_per_request(drv, main_file, monkeypatch):
+    """Many X-Y curves share one point budget (no memory explosion)."""
+    monkeypatch.setattr(eng_mod, "XY_MAX_POINTS", 40_000)
+    gen, model = drv.open(main_file.path)
+    _, amap, _ = drv.xmap(main_file.ids["Wave/XY"])
+    cids = [main_file.ids[k] for k in ("Wave/sig", "Wave/offset", "Wave/f32", "Wave/i32")]
+    out = drv.plot([PlotItem(c, amap, 0, N) for c in cids], 0.0, 1.0, 300)
+    total = sum(r[0].size for r in out.values())
+    assert total <= 40_000 + 4 * 2 * (N // 10_000 + 1)
+
+
+# -- fragmented files: channels of one family load in one pass -------------------------------
+
+@pytest.mark.parametrize("ram_mb", ["2048", "0"], ids=["ram", "disk"])
+def test_fragmented_family_loads_in_one_pass(new_driver, tmp_path, monkeypatch, ram_mb):
+    """300 small segments: 3 channels load together; values, pyramids and stats stay exact."""
+    from nptdms import ChannelObject, TdmsWriter
+
+    monkeypatch.setenv("TDMSVIEWER_RAM_MB", ram_mb)
+    rng = np.random.default_rng(7)
+    n_seg, npc = 300, 100
+    data = {"a": rng.normal(size=n_seg * npc),
+            "b": rng.integers(-1000, 1000, n_seg * npc).astype(np.int32),
+            "c": rng.normal(size=n_seg * npc).astype(np.float32)}
+    data["a"][12_345] = 99.0  # spike
+    path = tmp_path / "frag.tdms"
+    with TdmsWriter(str(path)) as w:
+        for k in range(n_seg):
+            w.write_segment([ChannelObject("G", nm, v[k * npc:(k + 1) * npc]) for nm, v in data.items()])
+    calls = []
+    orig = eng_mod.DataEngine._load_family
+
+    def spy(self, gen, src, group, builds, prog):
+        calls.append(sorted(st.info.name for st in group))
+        yield from orig(self, gen, src, group, builds, prog)
+
+    monkeypatch.setattr(eng_mod.DataEngine, "_load_family", spy)
+    drv = new_driver()
+    gen, model = drv.open(path)
+    assert calls == [["a", "b", "c"]]
+    n = n_seg * npc
+    for st in drv.eng._stores:
+        ref = data[st.info.name]
+        assert st.done and st.fast is not None and st.fast.fragmented
+        assert st.pyr is not None and st.pyr.complete
+        if ram_mb == "0":
+            assert st.ram is None
+        else:
+            np.testing.assert_array_equal(st.ram, ref)
+        xm = LinearMap(0.0, 1.0)
+        res = drv.plot([PlotItem(st.info.id, xm, 0, n)], 0.0, n - 1.0, 300)
+        check_plot(res[st.info.id], ref.astype(np.float64), xm, 0.0, n - 1.0, 300)
+        s = absolute_stats(drv.stats([PlotItem(st.info.id, xm, 0, n)], 0.0, n - 1.0)[st.info.id])
+        f = ref.astype(np.float64)
+        assert (s.n, s.min, s.max) == (n, f.min(), f.max())
+        assert math.isclose(s.mean, f.mean(), rel_tol=1e-12, abs_tol=1e-12)
+
+
+def test_iso_times_exact_to_ns():
+    from tdmsviewer.engine import iso_times
+    from tdmsviewer.xaxis import TimeRef
+
+    ref = TimeRef(1_785_233_136, 0.25)  # 2026-07-28T10:05:36.25Z
+    got = iso_times(ref, np.array([0.0, 1e-9, 0.75, 3600.5, -0.25, np.nan, np.inf, 1e13]))
+    assert got == ["2026-07-28T10:05:36.250000000Z", "2026-07-28T10:05:36.250000001Z",
+                   "2026-07-28T10:05:37.000000000Z", "2026-07-28T11:05:36.750000000Z",
+                   "2026-07-28T10:05:36.000000000Z", "", "", ""]
+    assert iso_times(ref, np.empty(0)) == []
+
+
+def test_disk_plot_reads_fragmented_family_once(new_driver, tmp_path, monkeypatch):
+    """Disk mode, raw zoom level: 3 channels of one family, one read_many for the request."""
+    from nptdms import ChannelObject, TdmsWriter
+
+    from tdmsviewer import fastread
+
+    monkeypatch.setenv("TDMSVIEWER_RAM_MB", "0")
+    rng = np.random.default_rng(11)
+    n_seg, npc = 700, 100
+    data = {nm: rng.normal(size=n_seg * npc) for nm in ("a", "b", "c")}
+    data["b"][40_004] = 1e6  # spike inside the plotted range
+    path = tmp_path / "frag_disk.tdms"
+    with TdmsWriter(str(path)) as w:
+        for k in range(n_seg):
+            w.write_segment([ChannelObject("G", nm, v[k * npc:(k + 1) * npc]) for nm, v in data.items()])
+    drv = new_driver()
+    drv.open(path)
+    calls = []
+    orig = fastread.read_many
+    monkeypatch.setattr(fastread, "read_many", lambda rs, a, b, outs=None: (calls.append((len(rs), a, b)),
+                                                                          orig(rs, a, b, outs))[1])
+    xm = LinearMap(0.0, 1.0)
+    n = n_seg * npc
+    ids = [st.info.id for st in drv.eng._stores]
+    xa, xb, px = 1000.0, 61_000.0, 1500  # ~60000 samples: below pyramid resolution -> raw read
+    res = drv.plot([PlotItem(cid, xm, 0, n) for cid in ids], xa, xb, px)
+    assert calls == [(3, 999, 61_002)]  # index_range adds one sample on each side
+    for st in drv.eng._stores:
+        check_plot(res[st.info.id], data[st.info.name], xm, xa, xb, px)
+    assert np.nanmax(res[ids[1]][1]) == 1e6
+    assert drv.eng._prefetched == {} and drv.eng._plot_req is None

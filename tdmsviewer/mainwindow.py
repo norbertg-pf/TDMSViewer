@@ -13,6 +13,9 @@ Selection
 
 from __future__ import annotations
 
+import collections
+import datetime as _dt
+import json
 import math
 import os
 
@@ -27,17 +30,21 @@ from PySide6.QtWidgets import (
 
 from . import __version__, theme
 from .engine import DataEngine, ExportRequest, PlotItem, PlotRequest, StatsRequest, TableRequest, XRequest
+from .formatting import format_datetime64, format_float, format_value
 from .plotpanel import LegendEntry, PlotPanel
 from .tables import (
-    PropertyFilter, PropertyModel, StatsModel, ValuesModel, ValuesView, copy_selection, set_clipboard,
+    COPY_MAX_CELLS, PropertyFilter, PropertyModel, StatsModel, ValuesModel, ValuesView, copy_selection,
+    selection_ranges, set_clipboard,
 )
-from .tdmsfile import KIND_TIME, ChannelInfo, FileModel
-from .xaxis import FMT_ABSOLUTE, FMT_NUMBER, FMT_RELATIVE, ArrayMap, LinearMap
+from .tdmsfile import KIND_COMPLEX, KIND_TIME, ChannelInfo, FileModel
+from .xaxis import FMT_ABSOLUTE, FMT_NUMBER, FMT_RELATIVE, ArrayMap, LinearMap, TimeRef
 
 ROLE_KIND = Qt.UserRole
 ROLE_ID = Qt.UserRole + 1
 SRC_WAVE, SRC_INDEX, SRC_CHAN = "wave", "index", "chan"
 MAX_RECENT = 10
+MAX_X_FILES = 50  # files with a stored X channel
+T0_SAMPLES = 1024  # the engine takes the first valid timestamp of these samples as zero
 
 
 def _human_bytes(n: float) -> str:
@@ -46,6 +53,40 @@ def _human_bytes(n: float) -> str:
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1000.0
     return str(n)
+
+
+def _first_time(a: np.ndarray):
+    """First valid timestamp (the zero of a timestamp plot), as the engine takes it."""
+    ok = a[~np.isnat(a)] if a.size else a
+    return ok[0].astype("datetime64[ns]") if ok.size else np.datetime64(0, "ns")
+
+
+def _short_local(t: np.datetime64) -> str:
+    """Local time 'YYYY-MM-DD HH:MM:SS[.fraction] TZ' (fraction only if not zero)."""
+    ns = int(np.datetime64(t, "ns").astype(np.int64))
+    sec, rem = divmod(ns, 1_000_000_000)
+    try:
+        d = _dt.datetime.fromtimestamp(sec, _dt.timezone.utc).astimezone()
+    except (OverflowError, OSError, ValueError):
+        return format_datetime64(t)
+    text = d.strftime("%Y-%m-%d %H:%M:%S")
+    if rem:
+        text += "." + f"{rem:09d}".rstrip("0")  # exact, no rounding
+    return f"{text} {d.strftime('%Z')}".strip()
+
+
+def _iso_utc(t_ref) -> str:
+    """ISO 8601 UTC text of a TimeRef, for example 2026-07-28T10:05:36.000000Z."""
+    t = TimeRef.of(t_ref)
+    ns = round(t.frac * 1e9)
+    sec = t.sec + ns // 1_000_000_000
+    ns %= 1_000_000_000
+    try:
+        d = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc) + _dt.timedelta(seconds=sec)
+    except OverflowError:
+        return f"{float(t)!r} s Unix time"
+    us, rem = divmod(ns, 1000)
+    return d.strftime("%Y-%m-%dT%H:%M:%S") + f".{us:06d}" + (f"{rem:03d}" if rem else "") + "Z"
 
 
 class MainWindow(QMainWindow):
@@ -64,6 +105,7 @@ class MainWindow(QMainWindow):
         self.x_array: ArrayMap | None = None
         self.x_array_tref = None
         self._plot_seq = 0
+        self._min_plot_seq = 0  # plot results of older requests belong to an old selection
         self._applied: dict[int, int] = {}
         self._table_seq = 0
         self._stats_seq = 0
@@ -72,6 +114,11 @@ class MainWindow(QMainWindow):
         self._copy_job = None
         self._xy_key = None
         self._incomplete = False
+        self._restore = None  # view state to restore after a reload (F5)
+        self._t0: dict[int, np.datetime64] = {}  # zero of timestamp plots (first valid sample)
+        self._t0_seq = 0  # table requests for timestamp zeros use negative seq numbers
+        self._t0_pending = False
+        self._stats_resize = False
 
         self.setWindowTitle("TDMS Viewer")
         self.setAcceptDrops(True)
@@ -97,6 +144,8 @@ class MainWindow(QMainWindow):
         self.path_edit = QLineEdit()
         self.path_edit.setPlaceholderText("Select a TDMS file to inspect")
         self.path_edit.returnPressed.connect(lambda: self.open_file(self.path_edit.text().strip()))
+        # A dropped file opens (MainWindow.dropEvent); it is not inserted as URL text.
+        self.path_edit.setAcceptDrops(False)
         path_row.addWidget(self.btn_browse)
         path_row.addWidget(self.path_edit, 1)
         ll.addLayout(path_row)
@@ -115,6 +164,7 @@ class MainWindow(QMainWindow):
         self.tree_filter = QLineEdit()
         self.tree_filter.setPlaceholderText("Filter channels")
         self.tree_filter.setClearButtonEnabled(True)
+        self.tree_filter.setAcceptDrops(False)
         self.tree_filter.textChanged.connect(self._filter_tree)
         tl.addWidget(self.tree, 1)
         tl.addWidget(self.tree_filter)
@@ -145,6 +195,7 @@ class MainWindow(QMainWindow):
         self.prop_filter = QLineEdit()
         self.prop_filter.setPlaceholderText("Filter properties")
         self.prop_filter.setClearButtonEnabled(True)
+        self.prop_filter.setAcceptDrops(False)
         self.prop_filter.textChanged.connect(self.prop_proxy.setFilterFixedString)
         pl.addWidget(self.prop_view, 1)
         pl.addWidget(self.prop_filter)
@@ -211,10 +262,22 @@ class MainWindow(QMainWindow):
         self.values_view = ValuesView()
         self.values_view.setModel(self.values_model)
         self.values_view.copyRequested.connect(self._copy_values)
+        self.values_note = QLabel("")
+        self.values_note.setWordWrap(True)
+        self.values_note.setStyleSheet("QLabel { background: #fff4ce; padding: 2px 4px; }")
+        self.values_note.hide()
+        values_box = QWidget()
+        vl = QVBoxLayout(values_box)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(0)
+        vl.addWidget(self.values_note)
+        vl.addWidget(self.values_view, 1)
 
         self.stats_model = StatsModel(self)
         self.stats_view = QTableView()
         self.stats_view.setModel(self.stats_model)
+        self.stats_view.setTextElideMode(Qt.ElideLeft)  # a cut number keeps its exponent: "…708e-05"
+        self.stats_view.setWordWrap(False)
         self.stats_view.verticalHeader().hide()
         self.stats_view.verticalHeader().setDefaultSectionSize(max(18, self.fontMetrics().height() + 4))
         self.stats_view.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -239,9 +302,9 @@ class MainWindow(QMainWindow):
         sl.addWidget(self.stats_view, 1)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self.values_view, "Values")
+        self.tabs.addTab(values_box, "Values")
         self.tabs.addTab(stats_box, "Statistics")
-        self.tabs.currentChanged.connect(lambda _: self._request_stats_soon())
+        self.tabs.currentChanged.connect(self._tab_changed)
 
         rsplit = QSplitter(Qt.Vertical)
         rsplit.addWidget(self.plot)
@@ -366,6 +429,25 @@ class MainWindow(QMainWindow):
         self.right_split.setSizes([560, 440])
         self.plot.split.setSizes([max(300, self.plot.width() - 180), 180])
 
+    def _x_choices(self) -> list[list[str]]:
+        """Stored X channels: [[file path, channel path], ...], newest last."""
+        try:
+            v = json.loads(self.settings.value("x_channel_by_file", "[]") or "[]")
+        except (TypeError, ValueError):
+            return []
+        return [p for p in v if isinstance(p, list) and len(p) == 2 and all(isinstance(s, str) for s in p)]
+
+    def _stored_x_channel(self, file_path: str) -> str:
+        """X channel path chosen last time for this file ("" = Waveform time)."""
+        return next((c for f, c in reversed(self._x_choices()) if f == file_path), "")
+
+    def _store_x_channel(self, file_path: str, chan_path: str) -> None:
+        """Store the X channel of one file only (another file starts with Waveform time, as NI)."""
+        v = [p for p in self._x_choices() if p[0] != file_path]
+        if chan_path:
+            v.append([file_path, chan_path])
+        self.settings.setValue("x_channel_by_file", json.dumps(v[-MAX_X_FILES:]))
+
     def _recent(self) -> list[str]:
         v = self.settings.value("recent", [])
         if isinstance(v, str):
@@ -393,7 +475,8 @@ class MainWindow(QMainWindow):
         if path:
             self.open_file(path)
 
-    def open_file(self, path: str) -> None:
+    def open_file(self, path: str, restore: dict | None = None) -> None:
+        """Open a file. restore: view state of reload() (selection, hidden plots, zoom, cursors)."""
         if not path:
             return
         path = os.path.abspath(os.path.expanduser(path))
@@ -404,14 +487,22 @@ class MainWindow(QMainWindow):
         self.path_edit.setText(path)
         self.path_edit.setToolTip(path)
         self._clear_view()
+        self._restore = restore
         self.gen = self.engine.open(path)
         self._set_status(f"Opening {os.path.basename(path)} ...")
         self.progress.setValue(0)
         self.progress.show()
 
     def reload(self) -> None:
+        """Open the file again (F5). Keeps selection, hidden plots, zoom and cursors if still valid.
+
+        After a failed open there is no model: use the path in the path box.
+        """
         if self.model is not None:
-            self.open_file(self.model.path)
+            path, restore = self.model.path, self._view_state()
+        else:
+            path, restore = self.path_edit.text().strip(), self._restore
+        self.open_file(path, restore)
 
     def close_file(self) -> None:
         self._clear_view()
@@ -423,6 +514,7 @@ class MainWindow(QMainWindow):
 
     def _clear_view(self) -> None:
         self._copy_job = None
+        self._restore = None
         self.x_combo.clear()
         self.x_source = (SRC_WAVE, None)
         self.model = None
@@ -430,13 +522,20 @@ class MainWindow(QMainWindow):
         self.maps = {}
         self.ranges = {}
         self.x_array = None
+        self._xy_key = None
         self._applied.clear()
+        self._t0.clear()
+        self._t0_pending = False
         self.tree.clear()
         self.prop_model.set_properties({})
         self.plot.set_channels([])
         self.plot.clear_history()
         self.values_model.set_channels([], 0, None)
+        self._update_values_note()
         self.stats_model.set_channels([])
+        self.stats_label.setText("")
+        self.plot.refresh_readout()  # no plots: empty readout
+        self.hover_label.setText("")
         self.warnings = []
         self.warn_btn.hide()
         self.progress.hide()
@@ -459,11 +558,110 @@ class MainWindow(QMainWindow):
         self.file_info = info
         for w in model.warnings:
             self._add_warning(w)
+        if self._restore is not None and self._restore_selection(self._restore):
+            return
         # NI default: the file is selected, so all channels are shown.
         root = self.tree.topLevelItem(0)
         if root is not None:
             self.tree.setCurrentItem(root)
             root.setSelected(True)
+
+    # ================================================================ reload state
+
+    def _item_key(self, it):
+        """Tree item as a key that stays valid in a reloaded file."""
+        if it is None or self.model is None:
+            return None
+        kind = it.data(0, ROLE_KIND)
+        if kind == "group":
+            return ("group", self.model.groups[it.data(0, ROLE_ID)].name)
+        if kind == "chan":
+            return ("chan", self.model.channels[it.data(0, ROLE_ID)].path)
+        return ("file", "")
+
+    def _item_of_key(self, key):
+        root = self.tree.topLevelItem(0)
+        if root is None or key is None:
+            return None
+        kind, name = key
+        if kind == "file":
+            return root
+        for gi in range(root.childCount()):
+            g = root.child(gi)
+            if kind == "group" and self.model.groups[g.data(0, ROLE_ID)].name == name:
+                return g
+            if kind == "chan":
+                for ci in range(g.childCount()):
+                    c = g.child(ci)
+                    if self.model.channels[c.data(0, ROLE_ID)].path == name:
+                        return c
+        return None
+
+    def _view_state(self) -> dict:
+        """What reload() keeps: tree selection, X source, hidden plots, zoom, cursors."""
+        (x0, x1), (y0, y1) = self.plot.vb.viewRange()
+        src, cid = self.x_source
+        return {
+            "selected": [self._item_key(it) for it in self.tree.selectedItems()],
+            "current": self._item_key(self.tree.currentItem()),
+            "x": (src, self.model.channels[cid].path if src == SRC_CHAN else ""),
+            "format": self.fmt_combo.currentData(),
+            "hidden": [self.model.channels[cid].path for cid in self.plot.hidden_cids()],
+            "view": (float(x0), float(x1), float(y0), float(y1), self.plot.auto_y_on()),
+            "cursors": self.plot.cursor_positions(),
+        }
+
+    def _restore_selection(self, st: dict) -> bool:
+        """Select the stored tree items and X source again. False if none of the items exists."""
+        src, xpath = st.get("x", (SRC_WAVE, ""))
+        want = next((i for i in range(self.x_combo.count())
+                     if (self.x_combo.itemData(i) or (None,))[0] == src
+                     and (src != SRC_CHAN or self.model.channels[self.x_combo.itemData(i)[1]].path == xpath)), 0)
+        if want != self.x_combo.currentIndex():
+            self.x_combo.setCurrentIndex(want)
+            self._x_source_changed(want)
+        items = [it for it in (self._item_of_key(k) for k in st.get("selected", [])) if it is not None]
+        if not items:
+            self._restore = None
+            return False
+        cur = self._item_of_key(st.get("current")) or items[0]
+        self.tree.blockSignals(True)
+        self.tree.setCurrentItem(cur)
+        self.tree.clearSelection()
+        for it in items:
+            it.setSelected(True)
+        self.tree.blockSignals(False)
+        self._tree_current_changed(cur, None)
+        self._tree_selection_changed()
+        return True
+
+    def _apply_restore(self) -> None:
+        """Hidden plots, zoom and cursors of the reload state (when the X values are ready)."""
+        st = self._restore
+        if st is None or self.model is None or (self.x_source[0] == SRC_CHAN and self.x_array is None):
+            return
+        self._restore = None
+        fmt = st.get("format")
+        i = self.fmt_combo.findData(fmt)
+        item = self.fmt_combo.model().item(i) if i >= 0 else None
+        if item is not None and item.isEnabled() and i != self.fmt_combo.currentIndex():
+            self.fmt_combo.setCurrentIndex(i)
+            self._x_format_changed(i)
+        hidden = set(st.get("hidden", []))
+        plotted = self.plot.plotted_cids()
+        if hidden and plotted:
+            show = {cid for cid in plotted if self.model.channels[cid].path not in hidden}
+            self.plot.set_all_visible(True, only=show)
+        x0, x1, y0, y1, auto_y = st.get("view", (0.0, 0.0, 0.0, 0.0, True))
+        ext = self._x_extent()
+        if ext is not None and all(map(math.isfinite, (x0, x1, y0, y1))) and x1 > x0 and x1 >= ext[0] and x0 <= ext[1]:
+            self.plot.vb.setRange(xRange=(x0, x1), yRange=(y0, y1), padding=0)
+            if auto_y:
+                self.plot.vb.enableAutoRange(y=True)
+        cur = st.get("cursors") or []
+        if len(cur) == 2 and all(map(math.isfinite, cur)):
+            self.plot.set_cursors_visible(True)
+            self.plot.set_cursor_positions(*cur)
 
     def _on_open_failed(self, gen: int, msg: str) -> None:
         if gen != self.gen:
@@ -595,39 +793,105 @@ class MainWindow(QMainWindow):
     def _range_changed(self, *args) -> None:
         self.samples_spin.setEnabled(not self.all_check.isChecked())
         if self.model is not None:
-            self.set_selection([c.id for c in self.current])
+            self.set_selection([c.id for c in self.current], keep_hidden=True)
 
-    def set_selection(self, cids: list[int]) -> None:
+    def set_selection(self, cids: list[int], keep_hidden: bool = False) -> None:
+        """Show these channels. keep_hidden: hidden plots stay hidden (range or X change)."""
         model = self.model
         if model is None:
             return
         self.current = [model.channels[i] for i in cids]
         self.ranges = {c.id: self._range(c) for c in self.current}
         self._build_maps()
+        # Results of older requests have the old maps and ranges: never draw them.
+        self._min_plot_seq = self._plot_seq + 1
+        self._applied.clear()
+        self._read_time_zeros()
+        self.plot.set_channels(self._legend_entries(), keep_hidden=keep_hidden)
+        self._update_axis_labels()
+        start = int(self.start_spin.value())
+        count = None if self.all_check.isChecked() else int(self.samples_spin.value())
+        self.values_model.set_channels(self.current, start, count)
+        self._update_values_note()
+        self.stats_model.set_channels(list(enumerate(self.current)))
+        self.stats_model.set_units(self._unit_texts())
+        self.engine.set_priority([c.id for c in self.current])
+        self._xy_key = None
+        self.plot.clear_history()
+        self.fit_view(push=False)
+        if self.plot.cursors_on():
+            self.plot.cursors_to_view()  # after a file, X or selection change they can be off-screen
+        if len(self.current) > 200:
+            self._set_status(f"{len(self.current)} channels selected. Large selections redraw slower.")
+        self._apply_restore()
+
+    # -- legend texts: same names, complex and timestamp channels --------------------
+
+    def _legend_entries(self) -> list[LegendEntry]:
+        names = collections.Counter(c.name for c in self.current)
         entries = []
         for n, c in enumerate(self.current):
             enabled = c.plottable and self.maps.get(c.id) is not None
+            # Same name in two groups: show group/name, or the plots look identical.
+            label = c.label if names[c.name] > 1 else c.name
             tip = f"{c.label}\n{c.length} samples, {c.kind}" + (f", unit {c.unit}" if c.unit else "")
+            if c.kind == KIND_COMPLEX:
+                label += " |z|"
+                tip += "\nComplex values: plotted and summarized as the magnitude |z|"
+            elif c.kind == KIND_TIME:
+                t0 = self._t0.get(c.id)
+                label += f" (s since {_short_local(t0)})" if t0 is not None else " (s since first sample)"
+                tip += ("\nTimestamps: plotted and summarized as seconds since the first valid sample"
+                        + (f"\n{format_datetime64(t0)}" if t0 is not None else ""))
             if not c.plottable:
                 tip += "\nNot plottable (table only)"
             elif self.x_source[0] == SRC_WAVE and not c.wf_increment:
                 tip += "\nNo wf_increment: drawn at 1 s per sample"
             elif self.maps.get(c.id) is None:
                 tip += "\nLength differs from the X channel: not plotted"
-            entries.append(LegendEntry(c.id, n, c.name, theme.plot_color(n), enabled, tip))
-        self._applied.clear()
-        self.plot.set_channels(entries)
+            entries.append(LegendEntry(c.id, n, label, theme.plot_color(n), enabled, tip))
+        return entries
+
+    def _unit_text(self, c: ChannelInfo) -> str:
+        """Unit of the plotted and summarized values of a channel."""
+        if c.kind == KIND_COMPLEX:
+            return f"|z| [{c.unit}]" if c.unit else "|z|"
+        if c.kind == KIND_TIME:
+            t0 = self._t0.get(c.id)
+            return f"s since {_short_local(t0)}" if t0 is not None else "s since first sample"
+        return c.unit
+
+    def _unit_texts(self) -> dict[int, str]:
+        return {c.id: self._unit_text(c) for c in self.current if c.kind in (KIND_COMPLEX, KIND_TIME)}
+
+    def _read_time_zeros(self) -> bool:
+        """Zero (first valid sample) of the timestamp channels of the selection.
+
+        Sync read if the channel is in RAM, else one table request (copy slot:
+        table scrolling cannot drop it). The labels are updated when it arrives.
+        Returns True if a new zero is known now.
+        """
+        missing, found = [], False
+        for c in self.current:
+            if c.kind != KIND_TIME or c.id in self._t0 or c.length == 0:
+                continue
+            a = self._try_read(c.id, 0, min(c.length, T0_SAMPLES))
+            if a is None:
+                missing.append(c.id)
+            else:
+                self._t0[c.id] = _first_time(a)
+                found = True
+        if missing and not self._t0_pending and self._copy_job is None:
+            self._t0_pending = True
+            self._t0_seq -= 1
+            self.engine.request_copy(TableRequest(self._t0_seq, missing, 0, T0_SAMPLES))
+        return found
+
+    def _refresh_labels(self) -> None:
+        """Legend, unit and axis texts again (for example: a timestamp zero is known now)."""
+        self.plot.update_entries(self._legend_entries())
+        self.stats_model.set_units(self._unit_texts())
         self._update_axis_labels()
-        start = int(self.start_spin.value())
-        count = None if self.all_check.isChecked() else int(self.samples_spin.value())
-        self.values_model.set_channels(self.current, start, count)
-        self.stats_model.set_channels(list(enumerate(self.current)))
-        self.engine.set_priority([c.id for c in self.current])
-        self._xy_key = None
-        self.plot.clear_history()
-        self.fit_view(push=False)
-        if len(self.current) > 200:
-            self._set_status(f"{len(self.current)} channels selected. Large selections redraw slower.")
 
     def _build_maps(self) -> None:
         model = self.model
@@ -692,7 +956,7 @@ class MainWindow(QMainWindow):
                              (SRC_WAVE, None))
         self.x_combo.addItem("Sample index", (SRC_INDEX, None))
         self.x_combo.insertSeparator(2)
-        want = self.settings.value("x_channel_path", "")
+        want = self._stored_x_channel(model.path)  # same file only
         pick = 0
         for c in model.channels:
             if c.plottable and c.length > 1:
@@ -715,21 +979,21 @@ class MainWindow(QMainWindow):
             return
         src, cid = data
         if src == SRC_CHAN:
-            self.settings.setValue("x_channel_path", self.model.channels[cid].path if self.model else "")
+            self._store_x_channel(self.model.path, self.model.channels[cid].path)
             self._x_seq += 1
             self.x_source = (SRC_CHAN, cid)
             self.x_array = None
             self._set_status(f"Loading X values of {self.model.channels[cid].label} ...")
             self.engine.request_x(XRequest(self._x_seq, cid))
             if self.current:
-                self.set_selection([c.id for c in self.current])
+                self.set_selection([c.id for c in self.current], keep_hidden=True)
             return
-        self.settings.setValue("x_channel_path", "")
+        self._store_x_channel(self.model.path, "")
         self.x_source = (src, None)
         self.x_array = None
         self._set_default_format()
         if self.current:
-            self.set_selection([c.id for c in self.current])
+            self.set_selection([c.id for c in self.current], keep_hidden=True)
 
     def _on_x_ready(self, gen: int, seq: int, res) -> None:
         if gen != self.gen or seq != self._x_seq:
@@ -746,7 +1010,7 @@ class MainWindow(QMainWindow):
         note = "" if amap.monotonic else " (not monotonic: X-Y plot of the full range)"
         self._set_status(f"X axis: {self.model.channels[cid].label}{note}")
         if self.current:
-            self.set_selection([c.id for c in self.current])
+            self.set_selection([c.id for c in self.current], keep_hidden=True)
 
     def _t_ref(self):
         src, _ = self.x_source
@@ -805,9 +1069,25 @@ class MainWindow(QMainWindow):
             except (OverflowError, OSError, ValueError):
                 pass
         self.plot.set_x_axis(fmt, t_ref, label)
-        units = {c.unit for c in self.current if c.plottable and self.maps.get(c.id) is not None}
-        unit = units.pop() if len(units) == 1 else ""
-        self.plot.set_y_label(f"Value [{unit}]" if unit else "")
+        self.plot.set_y_label(self._y_label())
+
+    def _y_label(self) -> str:
+        """Y axis label; says how complex and timestamp values are drawn."""
+        plotted = [c for c in self.current if c.plottable and self.maps.get(c.id) is not None]
+        labels = set()
+        for c in plotted:
+            if c.kind in (KIND_COMPLEX, KIND_TIME):
+                labels.add(self._unit_text(c))
+            else:
+                labels.add(f"Value [{c.unit}]" if c.unit else "")
+        if len(labels) == 1:
+            return labels.pop()
+        notes = []
+        if any(c.kind == KIND_COMPLEX for c in plotted):
+            notes.append("complex as |z|")
+        if any(c.kind == KIND_TIME for c in plotted):
+            notes.append("timestamps as s since first sample")
+        return f"Value ({', '.join(notes)})" if notes else ""
 
     # ================================================================ plot data
 
@@ -822,6 +1102,7 @@ class MainWindow(QMainWindow):
         if xy:
             key = (tuple((i.cid, i.s, i.e) for i in items), id(self.x_array))
             if key == self._xy_key:
+                self.plot.update_auto_y()  # same data, new view
                 self._request_stats_soon()
                 return
             self._xy_key = key
@@ -830,9 +1111,10 @@ class MainWindow(QMainWindow):
         self._request_stats_soon()
 
     def _on_plot_ready(self, gen: int, seq: int, results: dict) -> None:
-        if gen != self.gen:
-            return
+        if gen != self.gen or seq < self._min_plot_seq:
+            return  # other file, or a request of an older selection / X source / range
         incomplete = False
+        batch = []
         for cid, res in results.items():
             if res is None:
                 incomplete = True
@@ -840,9 +1122,10 @@ class MainWindow(QMainWindow):
             if seq < self._applied.get(cid, -1):
                 continue
             x, y, complete = res
-            self.plot.set_data(cid, x, y)
+            batch.append((cid, x, y))
             self._applied[cid] = seq
             incomplete = incomplete or not complete
+        self.plot.set_data_many(batch)  # one repaint and one auto Y for all plots
         self._incomplete = incomplete
 
     def _on_channels_updated(self, gen: int, cids) -> None:
@@ -857,6 +1140,8 @@ class MainWindow(QMainWindow):
         self._view_changed()
         self.values_model.invalidate()
         self.values_view._schedule()
+        if self._read_time_zeros():
+            self._refresh_labels()
 
     def _visibility_changed(self) -> None:
         self._xy_key = None
@@ -874,25 +1159,34 @@ class MainWindow(QMainWindow):
     def _on_table_ready(self, gen: int, seq: int, blocks: dict) -> None:
         if gen != self.gen:
             return
+        if seq < 0:  # zero of timestamp plots (_read_time_zeros)
+            if seq == self._t0_seq:
+                self._t0_pending = False
+                for cid, (_i0, arr) in blocks.items():
+                    self._t0[cid] = _first_time(arr)
+                if blocks:
+                    self._refresh_labels()
+            return
         job = self._copy_job
         if job is not None and seq == job[0]:
             self._copy_job = None
             self._finish_copy(job, blocks)
+            if self._read_time_zeros():
+                self._refresh_labels()
             return
         if seq == self._table_seq:
             self.values_model.put(blocks)
 
     def _copy_values(self) -> None:
-        sel = self.values_view.selectionModel()
-        if sel is None or not sel.selectedIndexes():
+        # Size the selection from its ranges: a Ctrl+A of millions of rows is one range.
+        ranges = selection_ranges(self.values_view)
+        if not ranges:
             return
-        idx = sel.selectedIndexes()
-        rows = [i.row() for i in idx]
-        cols = sorted({i.column() for i in idx})
-        r0, r1 = min(rows), max(rows) + 1
-        if (r1 - r0) * len(cols) > 2_000_000:
-            QMessageBox.information(self, "Copy", "The selection is too large to copy (max. 2 million cells). "
-                                                  "Use File > Export visible range as CSV.")
+        r0, r1 = min(r[0] for r in ranges), max(r[1] for r in ranges) + 1
+        cols = sorted({c for r in ranges for c in range(r[2], r[3] + 1)})
+        if (r1 - r0) * len(cols) > COPY_MAX_CELLS:  # rows r0..r1 are read: limit the box, not the cells
+            QMessageBox.information(self, "Copy", f"The selection is too large to copy (max. {COPY_MAX_CELLS:,} "
+                                                  "cells). Use File > Export visible range as CSV.")
             return
         m = self.values_model
         start = m.start
@@ -905,22 +1199,22 @@ class MainWindow(QMainWindow):
                 missing.append(c.id)
             else:
                 blocks[c.id] = (start + r0, a)
-        job = (None, r0, r1, cols, blocks)
+        job = (None, r0, r1, cols, blocks, ranges)
         if missing:
             self._table_seq += 1
-            self._copy_job = (self._table_seq, r0, r1, cols, blocks)
+            self._copy_job = (self._table_seq, r0, r1, cols, blocks, ranges)
             set_clipboard("")  # never paste old data if the copy cannot finish
+            self._t0_pending = False  # the copy request replaces a pending timestamp-zero request
             self.engine.request_copy(TableRequest(self._table_seq, missing, start + r0, start + r1))
             self._set_status("Copying ...")
             return
         self._finish_copy(job, {})
 
     def _finish_copy(self, job, extra: dict) -> None:
-        _, r0, r1, cols, blocks = job
+        _, r0, r1, cols, blocks, ranges = job
         blocks = dict(blocks)
         blocks.update(extra)
         m = self.values_model
-        from .formatting import format_value
 
         def value_of(r, col):
             c = m.channels[col]
@@ -933,7 +1227,27 @@ class MainWindow(QMainWindow):
                 return ""
             return format_value(arr[k])
 
-        text = copy_selection(self.values_view, value_of)
+        def column_texts(col, a, b):
+            """Texts of rows [a, b) of one column (one list comprehension, not one call per cell)."""
+            c = m.channels[col]
+            hit = blocks.get(c.id)
+            if hit is None:
+                return [""] * (b - a)
+            i0, arr = hit
+            k0 = max(0, m.start + a - i0)
+            k1 = max(k0, min(arr.size, m.stops[col] - i0, m.start + b - i0))
+            seg = arr[k0:k1]
+            # Same texts as format_value; tolist() makes no numpy scalar per value.
+            if seg.dtype == np.float64:
+                texts = [repr(v) if math.isfinite(v) else format_float(v) for v in seg.tolist()]
+            elif seg.dtype.kind in "iu":
+                texts = [str(v) for v in seg.tolist()]
+            else:
+                texts = [format_value(v) for v in seg]
+            lead = max(0, i0 + k0 - (m.start + a))
+            return [""] * lead + texts + [""] * (b - a - lead - len(texts))
+
+        text = copy_selection(self.values_view, value_of, ranges=ranges, column_texts=column_texts)
         set_clipboard(text)
         self._set_status(f"Copied {text.count(chr(10)) + 1 if text else 0} rows.")
 
@@ -945,8 +1259,26 @@ class MainWindow(QMainWindow):
             s, e = self.ranges[c.id]
             k = m.nearest(x, s, e)
             if k >= 0:
-                self.values_view.scroll_to_row(k - self.values_model.start)
+                row = k - self.values_model.start
+                if row >= self.values_model.rowCount() and self.values_model.clamped:
+                    self._set_status(f"Sample {k} is after the last table row. "
+                                     "Set Start index to see it in the table.")
+                self.values_view.scroll_to_row(row)
             return
+
+    def _update_values_note(self) -> None:
+        """Note above the table when the Qt row limit cuts the range."""
+        m = self.values_model
+        if not m.clamped:
+            self.values_note.hide()
+            return
+        nxt = m.start + m.rows
+        text = (f"The table shows the first {m.rows:,} of {m.total_rows:,} samples from Start index {m.start:,} "
+                f"(Qt row limit). Use Start index to page: set it to {nxt:,} for the next samples. "
+                "The graph, statistics and export use all samples.")
+        self.values_note.setText(text)
+        self.values_note.show()
+        self._set_status(f"Table shows the first {m.rows:,} rows from Start index; use Start index to page.")
 
     # ================================================================ statistics
 
@@ -973,11 +1305,22 @@ class MainWindow(QMainWindow):
     def _on_stats_ready(self, gen: int, seq: int, values: dict) -> None:
         if gen != self.gen or seq != self._stats_seq:
             return
-        first = not self.stats_model.values
         self.stats_model.put(values)
-        if first:
-            for col in range(3, self.stats_model.columnCount()):
-                self.stats_view.resizeColumnToContents(col)
+        self._stats_resize = True
+        if self.tabs.currentIndex() == 1:
+            self._fit_stats_columns()
+
+    def _fit_stats_columns(self) -> None:
+        """Unit and number columns as wide as their texts, on every result: a cut number
+        could be read as another value. Only while the tab is shown (few rows: cheap)."""
+        self._stats_resize = False
+        for col in range(2, self.stats_model.columnCount()):
+            self.stats_view.resizeColumnToContents(col)  # last column: stretches only into free space
+
+    def _tab_changed(self, index: int) -> None:
+        if index == 1 and self._stats_resize:
+            self._fit_stats_columns()
+        self._request_stats_soon()
 
     # ================================================================ export
 
@@ -992,14 +1335,74 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Export visible range as CSV", base, "CSV files (*.csv)")
         if not path:
             return
+        if not os.path.splitext(os.path.basename(path))[1]:
+            # Default suffix (as QFileDialog.setDefaultSuffix("csv")); ask before replacing a file.
+            path += ".csv"
+            if os.path.exists(path) and QMessageBox.question(
+                    self, "Export", f"{path} exists. Replace it?") != QMessageBox.Yes:
+                return
+        refuse = self._export_refused(path)
+        if refuse:
+            QMessageBox.warning(self, "Export", f"{refuse}\n\n{path}\n\nNo file was written.")
+            return
         xa, xb = self.plot.view_x_range()
+        t_ref, timed = self._export_time(items)
         header = []
         for it in items:
             c = self.model.channels[it.cid]
-            header += [f"{c.label} index", f"{c.label} x", f"{c.label}" + (f" [{c.unit}]" if c.unit else "")]
+            header += [f"{c.label} index", self._x_header(c)]
+            if t_ref is not None:
+                header.append(f"{c.label} time [UTC]")
+            header.append(f"{c.label}" + (f" [{c.unit}]" if c.unit else ""))
         self._export_seq += 1
-        self.engine.request_export(ExportRequest(self._export_seq, path, items, xa, xb, header))
+        self.engine.request_export(ExportRequest(self._export_seq, path, items, xa, xb, header,
+                                                 t_ref, frozenset(timed)))
         self._set_status("Exporting ...")
+
+    def _export_refused(self, path: str) -> str:
+        """Reason not to write the CSV to this path ("" = OK). The export never replaces TDMS data."""
+        if path.lower().endswith((".tdms", ".tdms_index")):
+            return "The export cannot write a .tdms or .tdms_index file. Use a .csv file name."
+        if self.model is not None and os.path.exists(path):
+            for p in (self.model.path, self.model.path + "_index"):
+                try:
+                    if os.path.exists(p) and os.path.samefile(path, p):
+                        return "This is the open TDMS file (or its index). Use another file name."
+                except OSError:
+                    pass
+        return ""
+
+    def _export_time(self, items) -> tuple:
+        """(TimeRef of x == 0, channel ids with an absolute time) for the CSV time column.
+
+        Waveform time: channels with wf_start_time and wf_increment. Time
+        channel as X: all channels. Otherwise no time column.
+        """
+        src, xcid = self.x_source
+        if src == SRC_WAVE and self.model.t_ref_unix is not None:
+            timed = {it.cid for it in items
+                     if self.model.channels[it.cid].wf_start_time is not None
+                     and self.model.channels[it.cid].wf_increment}
+            return (self.model.t_ref_unix, timed) if timed else (None, set())
+        if src == SRC_CHAN and self.model.channels[xcid].kind == KIND_TIME and self.x_array_tref is not None:
+            return TimeRef.of(self.x_array_tref), {it.cid for it in items}
+        return None, set()
+
+    def _x_header(self, c: ChannelInfo) -> str:
+        """CSV header of the x column of a channel: unit and time reference of x."""
+        src, xcid = self.x_source
+        if src == SRC_INDEX:
+            return f"{c.label} x [sample index]"
+        if src == SRC_WAVE:
+            t_ref = self.model.t_ref_unix
+            unit = f"s since {_iso_utc(t_ref)}" if t_ref is not None else "s"
+            if not c.wf_increment:
+                unit += ", no wf_increment: 1 s per sample"
+            return f"{c.label} x [{unit}]"
+        xc = self.model.channels[xcid]
+        if xc.kind == KIND_TIME and self.x_array_tref is not None:
+            return f"{c.label} x = {xc.label} [s since {_iso_utc(self.x_array_tref)}]"
+        return f"{c.label} x = {xc.label}" + (f" [{xc.unit}]" if xc.unit else "")
 
     def _on_export_done(self, gen: int, seq: int, msg: str) -> None:
         if gen == self.gen:
@@ -1026,7 +1429,7 @@ class MainWindow(QMainWindow):
             "  Wheel: zoom.  Shift+wheel: X only.  Ctrl+wheel: Y only\n"
             "  Wheel or drag on an axis: that axis only\n"
             "  Double-click or Home: zoom to fit.  Backspace: previous view\n"
-            "  Z / X / Y / P: select tool.  C: cursors on/off\n\n"
+            "  Z / X / Y / P: select tool.  C: cursors on/off (click the graph first)\n\n"
             "Legend\n"
             "  Checkbox: show/hide.  Right-click: color, line width, line/points\n\n"
             "Tree\n"

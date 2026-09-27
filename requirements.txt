@@ -1,4 +1,6 @@
-numpy>=1.24
-npTDMS>=1.9
-PySide6>=6.5
-pyqtgraph>=0.13.7
+# Tested ranges. npTDMS and pyqtgraph are capped: the viewer uses their
+# internals (fast reader, plot speed). Test before raising a cap.
+numpy>=1.26,<3
+npTDMS>=1.11,<1.12
+PySide6>=6.8,<7
+pyqtgraph>=0.13.7,<0.15

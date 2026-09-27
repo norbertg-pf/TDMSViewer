@@ -6,6 +6,16 @@ Summary
     the main window requests new data. X autorange on the drawn data is
     blocked, because the drawn data is only a window of the channel.
 
+Speed with many plots
+    Curves are kept in a pool and used again (creating and deleting
+    2000 PlotDataItems takes seconds). Auto Y is computed here from the
+    drawn data inside the X view, once per data update (set_data_many);
+    the pyqtgraph autorange computes the bounds of every curve on every
+    repaint and is not used. A range change is applied at once (not in
+    the next paint), so each change paints one time. Automatic point
+    markers (zoomed in to few samples) only for up to MAX_MARKER_PLOTS
+    visible plots.
+
 Mouse
     Left drag   zoom box / zoom X / zoom Y / pan (palette tool)
     Middle drag pan          Right drag  zoom about the start point
@@ -38,6 +48,7 @@ STYLE_LINE, STYLE_POINTS, STYLE_BOTH = "line", "points", "both"
 _ZOOM_TOOLS = (TOOL_ZOOM, TOOL_ZOOMX, TOOL_ZOOMY)
 MARGIN = 0.25  # extra data fetched on each side of the view (fraction of width)
 SPARSE_PX_PER_POINT = 8.0  # show point markers when points are this far apart
+MAX_MARKER_PLOTS = 100  # no automatic point markers above this number of visible plots
 
 
 def _keep_image_exporters() -> None:
@@ -55,10 +66,15 @@ _keep_image_exporters()
 
 
 class GraphViewBox(pg.ViewBox):
-    """ViewBox with LabVIEW-like tools and no X autorange."""
+    """ViewBox with LabVIEW-like tools and no X autorange.
+
+    Auto Y: state["autoRange"][1] is only the on/off flag (pyqtgraph sets
+    it off when the user changes Y). The panel sets the Y range itself.
+    """
 
     sigFit = Signal()
     sigBeforeChange = Signal()
+    sigAutoY = Signal()  # auto Y was switched on: set the Y range from the drawn data
 
     def __init__(self):
         super().__init__(enableMenu=True)
@@ -66,7 +82,11 @@ class GraphViewBox(pg.ViewBox):
         self.setMouseMode(self.PanMode)
         super().enableAutoRange(self.XAxis, False)
         super().enableAutoRange(self.YAxis, True)
-        self.setAutoVisible(y=True)
+
+    def setMouseMode(self, mode):
+        # The palette sets the left-drag tool. The ViewBox "1 button" mode
+        # would turn the pan tool into a zoom box: always keep PanMode.
+        super().setMouseMode(self.PanMode)
 
     # X autorange would fit the drawn window only. Route it to "fit".
     def enableAutoRange(self, axis=None, enable=True, x=None, y=None):
@@ -76,15 +96,31 @@ class GraphViewBox(pg.ViewBox):
             if y is not None:
                 self.enableAutoRange(self.YAxis, y)
             return
-        if axis is None or axis == self.XYAxes:
+        if axis is None or axis in (self.XYAxes, "xy"):
             self.enableAutoRange(self.XAxis, enable)
             self.enableAutoRange(self.YAxis, enable)
             return
-        if axis == self.XAxis and enable is not False and enable != 0:
+        if axis in (self.XAxis, "x") and enable is not False and enable != 0:
             super().enableAutoRange(self.XAxis, False)
             QTimer.singleShot(0, self.sigFit.emit)
             return
+        was_on = self.state["autoRange"][1] is not False
         super().enableAutoRange(axis, enable)
+        if axis in (self.YAxis, "y") and enable is not False and not was_on:
+            self.sigAutoY.emit()
+
+    def updateAutoRange(self):
+        # Do not compute the bounds of all curves (slow): PlotPanel.update_auto_y does it.
+        self._autoRangeNeedsUpdate = False
+
+    def updateViewRange(self, forceX=False, forceY=False):
+        super().updateViewRange(forceX, forceY)
+        # pyqtgraph applies a new range in the next paint; the curves then change
+        # their geometry during that paint and Qt paints all again. Apply it now:
+        # one paint per change.
+        r = self.rect()
+        if self._matrixNeedsUpdate and r.width() > 0 and r.height() > 0:
+            self.updateMatrix()
 
     def autoRange(self, padding=None, items=None, item=None):
         self.sigFit.emit()
@@ -153,7 +189,19 @@ class LegendEntry:
     tooltip: str = ""
 
 
+_ICONS: dict[tuple[int, bool], QIcon] = {}
+
+
 def _line_icon(color: QColor, enabled: bool = True) -> QIcon:
+    """Legend icon (cached: a selection has few colors but can have 1000s of plots)."""
+    key = (QColor(color).rgba(), bool(enabled))
+    icon = _ICONS.get(key)
+    if icon is None:
+        icon = _ICONS[key] = _draw_line_icon(color, enabled)
+    return icon
+
+
+def _draw_line_icon(color: QColor, enabled: bool) -> QIcon:
     pm = QPixmap(28, 14)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
@@ -239,12 +287,18 @@ class PlotPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         pg.setConfigOptions(antialias=False, background=theme.PLOT_BG, foreground=theme.PLOT_FG)
-        self._curves: dict[int, pg.PlotDataItem] = {}
+        self._curves: dict[int, pg.PlotDataItem] = {}  # current plots (curves from the pool)
+        self._pool: list[pg.PlotDataItem] = []  # all curves, created once, used again
+        self._n_used = 0  # curves of the pool in use
         self._inf_marks: dict[int, pg.ScatterPlotItem] = {}
+        self._inf_free: list[pg.ScatterPlotItem] = []
         self._styles: dict[int, dict] = {}  # current plots: color, width, mode
         self._user_styles: dict[int, dict] = {}  # styles set in the legend (this session)
         self._sparse: dict[int, bool] = {}
+        self._sorted: dict[int, bool] = {}  # x of the drawn data is sorted (not an X-Y plot)
+        self._hidden: set[int] = set()  # plots hidden in the legend
         self._entries: dict[int, LegendEntry] = {}
+        self._legend_key: list = []
         self._history: list = []
         self._last_push = 0.0
         self._restoring = False
@@ -254,8 +308,11 @@ class PlotPanel(QWidget):
         self.vb = GraphViewBox()
         self.xaxis = TimeAxisItem("bottom")
         self.plot = pg.PlotWidget(viewBox=self.vb, axisItems={"bottom": self.xaxis})
-        self.plot.setMenuEnabled(True)
         pi = self.plot.getPlotItem()
+        # No "Plot Options" menu: its transforms (log, FFT, ...) change the axes
+        # but not the decimated data, so values read off the axes would be wrong.
+        pi.setMenuEnabled(False, enableViewBoxMenu=True)
+        self._hide_mouse_mode_menu()
         pi.hideButtons()
         pi.showGrid(x=True, y=True, alpha=theme.GRID_ALPHA)
         pi.getAxis("left").enableAutoSIPrefix(False)
@@ -350,21 +407,37 @@ class PlotPanel(QWidget):
         self._cursor_timer.setSingleShot(True)
         self._cursor_timer.setInterval(40)
         self._cursor_timer.timeout.connect(self.cursorsChanged)
+        self._auto_y_timer = QTimer(self)
+        self._auto_y_timer.setSingleShot(True)
+        self._auto_y_timer.setInterval(0)
+        self._auto_y_timer.timeout.connect(self.update_auto_y)
         self.vb.sigXRangeChanged.connect(self._schedule_view)
         self.vb.sigResized.connect(self._schedule_view)
         self.vb.sigFit.connect(self.fitRequested)
         self.vb.sigBeforeChange.connect(self._push_history)
+        self.vb.sigAutoY.connect(self._auto_y_timer.start)
         self._hover_proxy = pg.SignalProxy(self.plot.scene().sigMouseMoved, rateLimit=30, slot=self._hover)
 
+        # Keys of the graph only: in the X combo boxes (same panel) C, S, ... select items.
         for key, fn in (("Z", lambda: self.set_tool(TOOL_ZOOM)), ("X", lambda: self.set_tool(TOOL_ZOOMX)),
                         ("Y", lambda: self.set_tool(TOOL_ZOOMY)), ("P", lambda: self.set_tool(TOOL_PAN)),
                         ("C", self.btn_cursors.toggle), ("Home", self.fitRequested.emit),
                         ("Backspace", self.back)):
-            act = QAction(self)
+            act = QAction(self.plot)
             act.setShortcut(key)
             act.setShortcutContext(Qt.WidgetWithChildrenShortcut)
             act.triggered.connect(fn)
-            self.addAction(act)
+            self.plot.addAction(act)
+
+    def _hide_mouse_mode_menu(self) -> None:
+        """Hide "Mouse Mode" of the ViewBox menu (the palette sets the tools)."""
+        menu = self.vb.menu
+        modes = getattr(menu, "mouseModes", None)
+        if menu is None or not modes:
+            return
+        for a in menu.actions():
+            if a.menu() is not None and modes[0] in a.menu().actions():
+                a.setVisible(False)
 
     # -- construction helpers ---------------------------------------------------------
 
@@ -379,57 +452,193 @@ class PlotPanel(QWidget):
 
     # -- channels and data ------------------------------------------------------------
 
-    def set_channels(self, entries: list[LegendEntry]) -> None:
-        """Replace the plots. Keeps nothing from the previous selection."""
-        for c in self._curves.values():
-            self.vb.removeItem(c)
-        self._curves.clear()
-        for m in self._inf_marks.values():
-            self.vb.removeItem(m)
-        self._inf_marks.clear()
+    def set_channels(self, entries: list[LegendEntry], keep_hidden: bool = False) -> None:
+        """Show these plots, without data (the data comes with set_data_many).
+
+        keep_hidden: plots hidden in the legend stay hidden (same channel id),
+        for example after a Start index or X source change.
+        Curves come from the pool. The legend is built again only if the
+        plots (id, number, color, enabled) change; texts are updated in place.
+        """
+        if not keep_hidden:
+            self._hidden = set()
+        self._release_inf_marks()
         self._styles.clear()
         self._sparse.clear()
+        self._sorted.clear()
         self._entries = {e.cid: e for e in entries}
+        enabled = [e for e in entries if e.enabled]
+        while len(self._pool) < len(enabled):
+            curve = pg.PlotDataItem(connect="finite", antialias=False, autoDownsample=False, clipToView=False)
+            curve.setVisible(False)
+            self.vb.addItem(curve)
+            self._pool.append(curve)
+        self._curves = {}
+        n = len(entries)
+        for curve, e in zip(self._pool, enabled):
+            st = dict(self._user_styles.get(e.cid) or {"color": QColor(e.color), "width": 1, "mode": STYLE_LINE})
+            self._styles[e.cid] = st
+            self._curves[e.cid] = curve
+            curve.setData([], [], connect="finite", **self._style_args(e.cid, False))
+            self._sparse[e.cid] = False
+            curve.setZValue(10 + n - e.number)
+            curve.setVisible(e.cid not in self._hidden)
+        for curve in self._pool[len(enabled):self._n_used]:
+            curve.setData([], [])
+            curve.setVisible(False)
+        self._n_used = len(enabled)
+        key = [(e.cid, e.number, QColor(e.color).rgba(), e.enabled) for e in entries]
         self.legend.blockSignals(True)
-        self.legend.clear()
-        for e in entries:
-            it = QListWidgetItem(_line_icon(e.color, e.enabled), f"{e.number:02d}  {e.label}")
-            it.setData(Qt.UserRole, e.cid)
-            it.setToolTip(e.tooltip)
-            if e.enabled:
-                it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
-                it.setCheckState(Qt.Checked)
-                st = dict(self._user_styles.get(e.cid) or {"color": QColor(e.color), "width": 1,
-                                                           "mode": STYLE_LINE})
-                self._styles[e.cid] = st
-                it.setIcon(_line_icon(st["color"], True))
-                curve = pg.PlotDataItem(pen=pg.mkPen(st["color"], width=st["width"]), connect="finite",
-                                        antialias=False, autoDownsample=False, clipToView=False)
-                curve.setZValue(10 + len(entries) - e.number)
-                self.vb.addItem(curve)
-                self._curves[e.cid] = curve
-            else:
-                it.setFlags(it.flags() & ~Qt.ItemIsUserCheckable & ~Qt.ItemIsEnabled)
-            self.legend.addItem(it)
+        if key == self._legend_key:
+            for i, e in enumerate(entries):
+                it = self.legend.item(i)
+                self._set_item_text(it, e)
+                if e.enabled:
+                    it.setCheckState(Qt.Unchecked if e.cid in self._hidden else Qt.Checked)
+                    it.setIcon(_line_icon(self._styles[e.cid]["color"], True))
+        else:
+            self.legend.clear()
+            for e in entries:
+                it = QListWidgetItem(_line_icon(e.color, e.enabled), "")
+                it.setData(Qt.UserRole, e.cid)
+                self._set_item_text(it, e)
+                if e.enabled:
+                    it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+                    it.setCheckState(Qt.Unchecked if e.cid in self._hidden else Qt.Checked)
+                    it.setIcon(_line_icon(self._styles[e.cid]["color"], True))
+                else:
+                    it.setFlags(it.flags() & ~Qt.ItemIsUserCheckable & ~Qt.ItemIsEnabled)
+                self.legend.addItem(it)
+            self._legend_key = key
         self.legend.blockSignals(False)
+        self._update_readout()
+
+    @staticmethod
+    def _set_item_text(it: QListWidgetItem, e: LegendEntry) -> None:
+        text = f"{e.number:02d}  {e.label}"
+        if it.text() != text:
+            it.setText(text)
+        if it.toolTip() != e.tooltip:
+            it.setToolTip(e.tooltip)
+
+    def update_entries(self, entries: list[LegendEntry]) -> None:
+        """New legend texts and tooltips of the current plots (no other change)."""
+        by_cid = {e.cid: e for e in entries}
+        for i in range(self.legend.count()):
+            it = self.legend.item(i)
+            e = by_cid.get(it.data(Qt.UserRole))
+            if e is not None:
+                self._entries[e.cid] = e
+                self._set_item_text(it, e)
 
     def set_data(self, cid: int, x: np.ndarray, y: np.ndarray) -> None:
+        """Data of one plot. Use set_data_many for more plots (one repaint, one auto Y)."""
         curve = self._curves.get(cid)
         if curve is None:
             return
+        self._draw(cid, curve, x, self._prepare(cid, x, y), self._markers_allowed())
+
+    def _prepare(self, cid: int, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        """Inf samples at the edge of the finite data; x sorted flag. Returns the y to draw."""
         if y.size and np.isinf(y).any():
             y = self._clamp_inf(cid, x, y)
         elif cid in self._inf_marks:
             self._inf_marks[cid].setData([], [])
-        sparse = False
-        if x.size >= 1:
-            (x0, x1), w = self.vb.viewRange()[0], max(1.0, self.vb.width())
-            span = x1 - x0
-            if span > 0:
-                visible = int(np.count_nonzero((x >= x0) & (x <= x1))) if x.size < 200000 else x.size
-                sparse = visible * SPARSE_PX_PER_POINT <= w
+        self._sorted[cid] = bool(x.size < 2 or np.all(x[1:] >= x[:-1]))
+        return y
+
+    def _markers_allowed(self) -> bool:
+        """Point markers only for few visible plots (thousands of symbol sets repaint slowly)."""
+        n = 0
+        for c in self._curves.values():
+            n += c.isVisible()
+            if n > MAX_MARKER_PLOTS:
+                return False
+        return True
+
+    def _draw(self, cid: int, curve, x: np.ndarray, y: np.ndarray, markers: bool) -> None:
+        # Point markers only if all points together are sparse on the screen. The engine
+        # sends the view plus a margin on each side (1 + 2 * MARGIN view widths).
+        # Never count the points inside the view: data outside the view would count 0.
+        w = max(1.0, float(self.vb.width())) * (1 + 2 * MARGIN)
+        sparse = markers and 0 < x.size and x.size * SPARSE_PX_PER_POINT <= w
+        if self._sparse.get(cid) == sparse:
+            curve.setData(x, y)  # same style: no new pens
+        else:
+            curve.setData(x, y, connect="finite", **self._style_args(cid, sparse))
         self._sparse[cid] = sparse
-        curve.setData(x, y, connect="finite", **self._style_args(cid, sparse))
+
+    def set_data_many(self, items) -> None:
+        """Data of many plots: items = [(cid, x, y), ...]. One Y update, one repaint."""
+        markers = self._markers_allowed()
+        todo = []
+        for cid, x, y in items:
+            curve = self._curves.get(cid)
+            if curve is not None:
+                todo.append((cid, curve, x, self._prepare(cid, x, y)))
+        # Y range first: then each curve makes its display data once, for the new view.
+        self._auto_y_timer.stop()
+        rng = self._auto_y_range({cid: (x, y) for cid, _, x, y in todo})
+        if rng is not None:
+            self._set_y_range(rng, [curve for _, curve, _, _ in todo])
+        for cid, curve, x, y in todo:
+            self._draw(cid, curve, x, y, markers)
+
+    def update_auto_y(self) -> None:
+        """If auto Y is on: Y range of the drawn data inside the X view (NaN ignored)."""
+        self._auto_y_timer.stop()
+        rng = self._auto_y_range({})
+        if rng is not None:
+            self._set_y_range(rng, [])
+
+    def _set_y_range(self, rng, new_data_curves) -> None:
+        """Set the Y range. Curves that get new data next skip their redraw for this change
+        (pyqtgraph dynamicRangeLimit: one updateItems per curve and Y change)."""
+        saved = []
+        for c in new_data_curves:
+            lim = c.opts.get("dynamicRangeLimit")
+            if lim is not None:
+                c.opts["dynamicRangeLimit"] = None
+                saved.append((c, lim))
+        try:
+            # Same padding as the pyqtgraph autorange; a flat line keeps the Y scale.
+            self.vb.setRange(yRange=rng, padding=None, disableAutoRange=False)
+        finally:
+            for c, lim in saved:
+                c.opts["dynamicRangeLimit"] = lim
+
+    def _auto_y_range(self, new: dict):
+        """(lo, hi) of the visible plots inside the X view, or None (auto Y off or no data).
+
+        new: {cid: (x, y)} data that is not in the curves yet.
+        """
+        if self.vb.state["autoRange"][1] is False:
+            return None
+        (x0, x1), _ = self.vb.viewRange()
+        lo, hi = math.inf, -math.inf
+        for cid, curve in self._curves.items():
+            if not curve.isVisible():
+                continue
+            x, y = new[cid] if cid in new else (curve.xData, curve.yData)
+            if x is None or y is None or not x.size:
+                continue
+            if self._sorted.get(cid, False):
+                i0 = int(np.searchsorted(x, x0, "left"))
+                i1 = int(np.searchsorted(x, x1, "right"))
+                if i1 - i0 < 2:  # view between two samples: use the line that crosses it
+                    i0, i1 = max(0, i0 - 1), min(x.size, i1 + 1)
+                seg = y[i0:i1]
+            else:
+                with np.errstate(invalid="ignore"):
+                    seg = y[(x >= x0) & (x <= x1)]
+            if not seg.size:
+                continue
+            a, b = np.fmin.reduce(seg), np.fmax.reduce(seg)  # NaN ignored; all NaN: NaN (skipped)
+            if a <= b:
+                lo, hi = min(lo, float(a)), max(hi, float(b))
+        if lo <= hi and math.isfinite(lo) and math.isfinite(hi):
+            return lo, hi
+        return None
 
     def _style_args(self, cid: int, sparse: bool) -> dict:
         """pyqtgraph pen/symbol arguments of a plot's style."""
@@ -457,6 +666,7 @@ class PlotPanel(QWidget):
             it = self.legend.item(i)
             if it.data(Qt.UserRole) == cid:
                 it.setIcon(_line_icon(self._styles[cid]["color"], True))
+                break
 
     def set_style(self, cids, **changes) -> None:
         """Change color / width / mode of plots (view only; the file is not changed)."""
@@ -481,19 +691,31 @@ class PlotPanel(QWidget):
         y[neg] = lo - pad
         marks = self._inf_marks.get(cid)
         if marks is None:
-            marks = pg.ScatterPlotItem(size=11, pen=pg.mkPen("#b00020"), brush=pg.mkBrush("#ff4d6d"))
-            marks.setZValue(900)
-            marks.setToolTip("Inf sample (drawn at the edge of the finite data)")
-            self.vb.addItem(marks)
+            if self._inf_free:
+                marks = self._inf_free.pop()
+            else:
+                marks = pg.ScatterPlotItem(size=11, pen=pg.mkPen("#b00020"), brush=pg.mkBrush("#ff4d6d"))
+                marks.setZValue(900)
+                marks.setToolTip("Inf sample (drawn at the edge of the finite data)")
+                self.vb.addItem(marks, ignoreBounds=True)
             self._inf_marks[cid] = marks
         sel = pos | neg
         marks.setData(x[sel], y[sel], symbol=np.where(pos[sel], "t1", "t").tolist())
         marks.setVisible(self._curves[cid].isVisible())
         return y
 
+    def _release_inf_marks(self) -> None:
+        for m in self._inf_marks.values():
+            m.setData([], [])
+            m.setVisible(False)
+            self._inf_free.append(m)
+        self._inf_marks.clear()
+
     def clear_data(self) -> None:
         for c in self._curves.values():
             c.setData([], [])
+        for m in self._inf_marks.values():
+            m.setData([], [])
 
     def visible_cids(self) -> list[int]:
         return [cid for cid, c in self._curves.items() if c.isVisible()]
@@ -557,6 +779,9 @@ class PlotPanel(QWidget):
     def set_y_view(self, y0: float, y1: float) -> None:
         self.vb.setYRange(y0, y1, padding=0.02)
 
+    def auto_y_on(self) -> bool:
+        return self.vb.state["autoRange"][1] is not False
+
     def _schedule_view(self, *args) -> None:
         if not self._view_timer.isActive():
             self._view_timer.start()
@@ -611,11 +836,8 @@ class PlotPanel(QWidget):
             self.btn_cursors.setChecked(on)
             return
         if on:
-            x0, x1 = self.view_x_range()
-            for i, line in enumerate(self.cursors):
-                v = line.value()
-                if not (x0 <= v <= x1):
-                    line.setValue(x0 + (x1 - x0) * (i + 1) / 3.0)
+            self.cursors_to_view()
+            for line in self.cursors:
                 line.show()
         else:
             for line in self.cursors:
@@ -629,6 +851,19 @@ class PlotPanel(QWidget):
     def cursor_positions(self) -> list[float]:
         return [float(c.value()) for c in self.cursors] if self.cursors_on() else []
 
+    def cursors_to_view(self) -> None:
+        """Put C1, C2 at 1/3 and 2/3 of the view if one is outside it or both are at one x."""
+        x0, x1 = self.view_x_range()
+        a, b = (float(c.value()) for c in self.cursors)
+        if a != b and x0 <= a <= x1 and x0 <= b <= x1:
+            return
+        for i, line in enumerate(self.cursors):
+            line.setValue(x0 + (x1 - x0) * (i + 1) / 3.0)
+
+    def set_cursor_positions(self, a: float, b: float) -> None:
+        for line, v in zip(self.cursors, (a, b)):
+            line.setValue(v)
+
     def _cursor_moving(self) -> None:
         self._update_readout()
         self._cursor_timer.start()
@@ -638,7 +873,7 @@ class PlotPanel(QWidget):
             self.cursorMoved.emit(float(line.value()))
 
     def _update_readout(self) -> None:
-        if not self.cursors_on():
+        if not self.cursors_on() or not self._entries:
             self.readout.setText("")
             return
         a, b = (float(c.value()) for c in self.cursors)
@@ -657,7 +892,9 @@ class PlotPanel(QWidget):
         cid = item.data(Qt.UserRole)
         curve = self._curves.get(cid)
         if curve is not None:
-            curve.setVisible(item.checkState() == Qt.Checked)
+            vis = item.checkState() == Qt.Checked
+            curve.setVisible(vis)
+            (self._hidden.discard if vis else self._hidden.add)(cid)
             if cid in self._inf_marks:
                 self._inf_marks[cid].setVisible(curve.isVisible())
             self.visibilityChanged.emit()
@@ -672,10 +909,15 @@ class PlotPanel(QWidget):
             vis = (cid in only) if only is not None else on
             it.setCheckState(Qt.Checked if vis else Qt.Unchecked)
             self._curves[cid].setVisible(vis)
+            (self._hidden.discard if vis else self._hidden.add)(cid)
             if cid in self._inf_marks:
                 self._inf_marks[cid].setVisible(vis)
         self.legend.blockSignals(False)
         self.visibilityChanged.emit()
+
+    def hidden_cids(self) -> set[int]:
+        """Plots hidden in the legend."""
+        return {cid for cid in self._hidden if cid in self._curves}
 
     def _legend_menu(self, pos) -> None:
         m = QMenu(self)

@@ -8,11 +8,11 @@ version = "1.0.0"
 description = "Fast, read-only viewer for NI TDMS files (replaces the NI TDMS File Viewer on Ubuntu)."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-    "numpy>=1.24",
-    "npTDMS>=1.9",
-    "PySide6>=6.5",
-    "pyqtgraph>=0.13.7",
+dependencies = [  # tested ranges, see requirements.txt
+    "numpy>=1.26,<3",
+    "npTDMS>=1.11,<1.12",
+    "PySide6>=6.8,<7",
+    "pyqtgraph>=0.13.7,<0.15",
 ]
 
 [project.optional-dependencies]

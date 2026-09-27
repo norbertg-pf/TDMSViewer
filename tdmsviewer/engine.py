@@ -28,11 +28,15 @@ from dataclasses import dataclass, field
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
+from . import fastread
 from . import pyramid as pyr
 from .tdmsfile import KIND_BOOL, KIND_COMPLEX, KIND_INT, KIND_TIME, PLOTTABLE, ChannelInfo, TdmsSource
 from .xaxis import ArrayMap, LinearMap, TimeRef, is_monotonic
 
 BLOCK = 1 << 22  # samples per load step
+FAMILY_STEP_BYTES = 32 << 20  # bytes per load step when channels load together
+FAMILY_READ_MIN = 1 << 15  # plot: raw reads from this size read the channel family in one pass
+FAMILY_READ_MAX = 1 << 25  # plot: max samples of one family read (all channels)
 PYR_BASE_RAM = 256
 PYR_MIN_LEN = 4096  # no pyramid below this length (raw decimation is cheap)
 RAW_DECIMATE_MAX = 1 << 24  # max raw samples for statistics on demand
@@ -124,6 +128,10 @@ class ExportRequest:
     xa: float
     xb: float
     header: list
+    # Absolute time: x is seconds since time_ref (TimeRef). Each channel then
+    # gets a UTC ISO 8601 column after x; empty for channels not in time_cids.
+    time_ref: object = None
+    time_cids: frozenset = frozenset()
 
 
 class _Store:
@@ -237,9 +245,15 @@ class DataEngine(QObject):
         self._tasks: list = []  # user tasks (generators): export, X values
         self._builds: list = []  # helper-thread futures of the current file
         self._raw_budget = RAW_PLOT_BUDGET
+        self._xy_points = XY_MAX_POINTS
+        self._plot_req = None  # (request, pixels) while a plot request runs
+        self._prefetched: dict = {}  # cid -> (i0, i1, values), this plot request only
+        self._file_stat = None  # (size, mtime, inode) at open: detect a rewrite
+        self._file_warned = False
+        self._stat_checked = 0.0
         self._priority: list[int] = []
-        self._pool = futures.ThreadPoolExecutor(max_workers=max(1, min(4, (os.cpu_count() or 2) - 2)),
-                                                thread_name_prefix="tdms-pyramid")
+        self._pool_workers = max(1, min(4, (os.cpu_count() or 2) - 2))
+        self._pool = futures.ThreadPoolExecutor(max_workers=self._pool_workers, thread_name_prefix="tdms-pyramid")
         self._thread = threading.Thread(target=self._run, name="tdms-engine", daemon=True)
         self._thread.start()
 
@@ -351,7 +365,10 @@ class DataEngine(QObject):
                 if job is None and task is None:
                     self._bg = None
                 traceback.print_exc()
-                self.message.emit(self._stores_gen, f"Internal error: {exc}")
+                gen = self._stores_gen
+                if job is not None and isinstance(job[1], tuple) and job[1] and isinstance(job[1][0], int):
+                    gen = job[1][0]  # report to the file the job belongs to
+                self.message.emit(gen, f"Internal error: {exc}")
         self._close_source()
 
     def _pending(self, kind: str) -> bool:
@@ -417,7 +434,27 @@ class DataEngine(QObject):
             self._stores_gen = gen
             self.openFailed.emit(gen, f"{type(exc).__name__}: {exc}")
             return
+        try:
+            self._setup_file(gen, src, t)
+        except Exception as exc:  # never leave the GUI at "Opening ..."
+            traceback.print_exc()
+            self._close_source()
+            try:
+                src.close()
+            except Exception:
+                pass
+            self._stores_gen = gen
+            self.openFailed.emit(gen, f"{type(exc).__name__}: {exc}")
+
+    def _setup_file(self, gen: int, src: TdmsSource, t: float) -> None:
+        """Residency, stores and background load of a new file."""
         model = src.model
+        try:
+            st = os.stat(src.path)
+            self._file_stat = (st.st_size, st.st_mtime_ns, st.st_ino)
+        except OSError:
+            self._file_stat = None
+        self._file_warned = False
         # Residency: RAM for channels that fit the budget, in file order.
         budget = ram_budget_bytes()
         used = 0
@@ -457,21 +494,34 @@ class DataEngine(QObject):
         chunk_ids = {s.info.id for s in chunk_pass}
         builds = self._builds
         remaining = dict.fromkeys(s.info.id for s in stores if s.info.id not in chunk_ids)
+        # Fragmented fast channels of one family load together: one file pass, not one per channel.
+        families: dict = {}
+        for s in stores:
+            if s.info.id in remaining and s.fast is not None and s.fast.fragmented and s.info.length:
+                families.setdefault((s.fast.family, s.to_ram), []).append(s)
         while remaining:
             pick = next((c for c in self._priority if c in remaining), None)
             if pick is None:
                 pick = next(iter(remaining))
-            del remaining[pick]
             st = stores[pick]
+            group = [st]
+            if st.fast is not None and st.fast.fragmented and st.info.length:
+                group = [s for s in families.get((st.fast.family, st.to_ram), ()) if s.info.id in remaining] or [st]
+            for s in group:
+                del remaining[s.info.id]
             before = prog.done
             try:
-                yield from self._load_channel(gen, src, st, builds, prog)
+                if len(group) > 1:
+                    yield from self._load_family(gen, src, group, builds, prog)
+                else:
+                    yield from self._load_channel(gen, src, st, builds, prog)
             except Exception as exc:  # one bad channel must not stop the others
-                st.done = True
+                for s in group:
+                    s.done = True
                 self.message.emit(gen, f"{st.info.label}: cannot read ({type(exc).__name__}: {exc})")
             if gen != self._stores_gen:
                 return
-            prog.done = before + st.info.length * _itemsize(st.info)
+            prog.done = before + sum(s.info.length * _itemsize(s.info) for s in group)
             yield
         if chunk_pass:
             try:
@@ -495,6 +545,76 @@ class DataEngine(QObject):
             self.message.emit(gen, w)
         self.progress.emit(gen, 1.0, f"Loaded {prog.total / 1e6:.1f} MB in {prog.elapsed():.2f} s")
 
+    @staticmethod
+    def _set_t0(src: TdmsSource, st: _Store) -> None:
+        """Integer origin of time and int64/uint64 channels (exact float64 offsets)."""
+        info = st.info
+        if info.kind == KIND_TIME and st.t0 is None:
+            st.t0 = _first_time(src.read(info.id, 0, min(info.length, 1024)))
+        elif _big_int(info) and st.t0 is None:
+            st.t0 = _int_zero(src.read(info.id, 0, 1))
+
+    def _load_family(self, gen: int, src: TdmsSource, group: list, builds: list, prog):
+        """Load fragmented fast channels of one family in one pass (generator).
+
+        RAM mode: the worker fills all arrays block by block. Disk mode:
+        helper threads stream the pyramids, each for a share of the channels.
+        """
+        n = group[0].info.length
+        for st in group:
+            self._set_t0(src, st)
+        readers = [st.fast for st in group]
+        row = sum(r.dtype.itemsize for r in readers)
+        base = max(st.base for st in group)
+        step = max(base, FAMILY_STEP_BYTES // row // base * base)
+        if group[0].to_ram:
+            arrs = [np.empty(n, dtype=st.info.dtype) for st in group]
+            label = f"Loading {len(group)} channels"
+            for i in range(0, n, step):
+                if gen != self._stores_gen:
+                    return
+                k = min(step, n - i)
+                fastread.read_many(readers, i, i + k, [a[i:i + k] for a in arrs])
+                prog.add(k * row, label)
+                yield
+            for st, arr in zip(group, arrs):
+                st.ram = arr
+                if st.info.plottable and n >= PYR_MIN_LEN:
+                    st.pyr = pyr.Pyramid(n, st.base)
+                    builds.append(self._pool.submit(self._build_pyramid, gen, st, arr))
+                else:
+                    st.done = True
+            self.channelsUpdated.emit(gen, [st.info.id for st in group if st.done])
+            return
+        streamed = [st for st in group if st.info.plottable and n >= PYR_MIN_LEN]
+        for st in group:
+            if st in streamed:
+                st.pyr = pyr.Pyramid(n, st.base)
+            else:
+                st.done = True  # read on demand only
+        threads = max(1, min(len(streamed), self._pool_workers))
+        for k in range(threads):
+            share = streamed[k::threads]
+            builds.append(self._pool.submit(self._stream_family, gen, share, step))
+        yield
+
+    def _stream_family(self, gen: int, sts: list, step: int) -> None:
+        """Helper thread: pyramids of several disk channels from one pass."""
+        readers = [st.fast for st in sts]
+        n = sts[0].info.length
+        bufs = [np.empty(min(n, step), dtype=r.dtype) for r in readers]
+        for i in range(0, n, step):
+            if gen != self._stores_gen or gen != self._gen:
+                return
+            k = min(step, n - i)
+            outs = fastread.read_many(readers, i, i + k, [b[:k] for b in bufs])
+            for st, blk in zip(sts, outs):
+                st.pyr.append(to_f64(blk, st.info.kind, st.t0))
+        for st in sts:
+            st.done = True
+        if gen == self._stores_gen:
+            self.channelsUpdated.emit(gen, [st.info.id for st in sts])
+
     def _load_channel(self, gen: int, src: TdmsSource, st: _Store, builds: list, prog):
         """Load one channel: RAM copy and/or pyramid (generator)."""
         info = st.info
@@ -502,10 +622,7 @@ class DataEngine(QObject):
         if n == 0:
             st.done = True
             return
-        if info.kind == KIND_TIME and st.t0 is None:
-            st.t0 = _first_time(src.read(info.id, 0, min(n, 1024)))
-        elif _big_int(info) and st.t0 is None:
-            st.t0 = _int_zero(src.read(info.id, 0, 1))
+        self._set_t0(src, st)
         want_pyr = info.plottable and n >= PYR_MIN_LEN
         label = f"Loading {info.label}"
         if st.to_ram:
@@ -612,6 +729,24 @@ class DataEngine(QObject):
 
     # -- reading helpers (worker) ---------------------------------------------------
 
+    def _check_file_changed(self, gen: int) -> None:
+        """Warn once if the open file was rewritten, replaced or grew (at most 2x per second)."""
+        if self._file_stat is None or self._file_warned or self._source is None:
+            return
+        now = time.monotonic()
+        if now - self._stat_checked < 0.5:
+            return
+        self._stat_checked = now
+        try:
+            st = os.stat(self._source.path)
+            cur = (st.st_size, st.st_mtime_ns, st.st_ino)
+        except OSError:
+            cur = None
+        if cur != self._file_stat:
+            self._file_warned = True
+            self.message.emit(gen, "The file was changed on disk after it was opened. The display can mix "
+                                   "old and new data. Press F5 to reload.")
+
     def _store(self, cid) -> _Store | None:
         """Store of a channel id, or None for an unknown id (also negative ids)."""
         if isinstance(cid, (int, np.integer)) and 0 <= cid < len(self._stores):
@@ -621,7 +756,44 @@ class DataEngine(QObject):
     def _read(self, st: _Store, i0: int, i1: int) -> np.ndarray:
         if st.ram is not None:
             return st.ram[max(0, i0):max(0, i1)]
+        pf = self._prefetched.get(st.info.id)
+        if pf is None and self._plot_req is not None and i1 - i0 >= FAMILY_READ_MIN:
+            self._read_family(st, i0, i1)
+            pf = self._prefetched.get(st.info.id)
+        if pf is not None and pf[0] <= max(0, i0) and min(i1, st.info.length) <= pf[1]:
+            return pf[2][max(0, i0) - pf[0]:min(i1, st.info.length) - pf[0]]
         return self._source.read(st.info.id, i0, i1)
+
+    def _read_family(self, st: _Store, i0: int, i1: int) -> None:
+        """Plot of a fragmented disk channel: read [i0, i1) of the channels of its
+        family that this request needs in the same range, in one file pass.
+
+        Only loaded channels (each takes the same raw path). No read if no
+        other channel needs this range.
+        """
+        f = st.fast
+        if f is None or not f.fragmented or not st.done:
+            return
+        req, _px = self._plot_req
+        group = [st]
+        for it in req.items:
+            o = self._store(it.cid)
+            if (o is None or o in group or o.ram is not None or o.fast is None or not o.done
+                    or o.fast.family != f.family or not o.info.plottable or it.cid in self._prefetched
+                    or (isinstance(it.xmap, ArrayMap) and not it.xmap.monotonic)):
+                continue
+            e = min(it.e, o.info.length)
+            if isinstance(it.xmap, ArrayMap):
+                e = min(e, it.xmap.x.size)
+            if it.xmap.index_range(req.xa, req.xb, it.s, e) == (i0, i1):
+                if (len(group) + 1) * (i1 - i0) > FAMILY_READ_MAX:
+                    break
+                group.append(o)
+        if len(group) < 2:
+            return
+        a, b = max(0, i0), min(i1, f.length)
+        for o, arr in zip(group, fastread.read_many([o.fast for o in group], a, b)):
+            self._prefetched[o.info.id] = (a, b, arr)
 
     def _read_f64(self, st: _Store, i0: int, i1: int) -> np.ndarray:
         """float64 values; timestamps and int64/uint64 relative to st.t0."""
@@ -645,9 +817,21 @@ class DataEngine(QObject):
     # -- plot -----------------------------------------------------------------------
 
     def _do_plot(self, gen: int, req: PlotRequest) -> None:
-        out = {}
         px = max(16, int(req.pixels))
+        self._plot_req = (req, px)
+        try:
+            self._do_plot_items(gen, req, px)
+        finally:
+            self._plot_req = None
+            self._prefetched = {}
+
+    def _do_plot_items(self, gen: int, req: PlotRequest, px: int) -> None:
+        out = {}
         self._raw_budget = RAW_PLOT_BUDGET
+        # X-Y plots: one point budget for the whole request, not per channel.
+        n_xy = sum(1 for it in req.items if isinstance(it.xmap, ArrayMap) and not it.xmap.monotonic)
+        self._xy_points = max(min(2_000, XY_MAX_POINTS), XY_MAX_POINTS // max(1, n_xy))
+        self._check_file_changed(gen)
         for it in req.items:
             if self._pending("plot"):
                 if out:  # a newer view exists: deliver what is done
@@ -675,7 +859,7 @@ class DataEngine(QObject):
         if isinstance(xmap, ArrayMap):
             e = min(e, xmap.x.size)
             if not xmap.monotonic:
-                return self._plot_xy(st, xmap, s, e)
+                return self._plot_xy(st, xmap, s, e, self._xy_points)
         i0, i1 = xmap.index_range(xa, xb, s, e)
         n = i1 - i0
         if n <= 0:
@@ -699,6 +883,13 @@ class DataEngine(QObject):
                 complete = False
         elif p is None and (n > self._raw_plot_max(st) * 8 or not self._take_raw_budget(st, n)):
             return None  # not loaded yet: drawn when channelsUpdated arrives
+        elif (p is not None and p.covered >= i1 and st.ram is None and st.fast is None
+              and n > self._raw_plot_max(st)):
+            # npTDMS-only channel on disk (DAQmx, scaled): a raw read would decode every
+            # channel of each segment. Draw the pyramid at its own resolution instead
+            # (exact min/max per bucket, a little coarser than one bucket per pixel).
+            c, mn, mx, miss = p.minmax(i0, i1, p.base, rr, with_missing=True)
+            complete = True
         else:
             # Bucket smaller than the pyramid base: n < base * px samples.
             c, mn, mx, miss = pyr.raw_minmax(self._read_f64(st, i0, i1), i0, b, with_missing=True)
@@ -725,7 +916,7 @@ class DataEngine(QObject):
             return RAW_PLOT_MAX * 4  # RAM: compute only, no I/O
         return RAW_PLOT_MAX if st.fast is not None else RAW_PLOT_MAX // 8
 
-    def _plot_xy(self, st: _Store, xmap: ArrayMap, s: int, e: int):
+    def _plot_xy(self, st: _Store, xmap: ArrayMap, s: int, e: int, max_points: int = XY_MAX_POINTS):
         n = e - s
         if n <= 0:
             return np.empty(0), np.empty(0), True
@@ -733,9 +924,9 @@ class DataEngine(QObject):
             return None
         y = self._read_f64(st, s, e)
         x = xmap.x[s:e]
-        if n <= XY_MAX_POINTS:
+        if n <= max_points:
             return x, y, True
-        b = -(-n // (XY_MAX_POINTS // 2))
+        b = -(-n // (max_points // 2))
         k = n // b
         body = y[: k * b].reshape(k, b)
         lo = np.where(np.isnan(body), np.inf, body).argmin(axis=1)
@@ -752,6 +943,7 @@ class DataEngine(QObject):
     # -- table ----------------------------------------------------------------------
 
     def _do_table(self, gen: int, req: TableRequest, kind: str = "table") -> None:
+        self._check_file_changed(gen)
         out = {}
         for cid in req.cids:
             if self._pending(kind):
@@ -771,6 +963,7 @@ class DataEngine(QObject):
     # -- statistics -----------------------------------------------------------------
 
     def _do_stats(self, gen: int, req: StatsRequest) -> None:
+        self._check_file_changed(gen)
         out = {}
         for it in req.items:
             if self._pending("stats"):
@@ -830,6 +1023,14 @@ class DataEngine(QObject):
     # -- x channel ------------------------------------------------------------------
 
     def _x_task(self, gen: int, req: XRequest):
+        """Load a channel as X values; any error is answered (the GUI falls back)."""
+        try:
+            yield from self._x_task_body(gen, req)
+        except Exception as exc:
+            traceback.print_exc()
+            self.xReady.emit(gen, req.seq, f"Cannot read the X values: {type(exc).__name__}: {exc}")
+
+    def _x_task_body(self, gen: int, req: XRequest):
         """Load a channel as X values (task: one block per step, cancellable)."""
         st = self._store(req.cid)
         if st is None:
@@ -890,6 +1091,7 @@ class DataEngine(QObject):
                     i0, i1 = inner_range(it.xmap, req.xa, req.xb, it.s, e)
                     cols.append((st, it, (i0, i1), max(0, i1 - i0)))
             rows = max((c[3] for c in cols), default=0)
+            timed = req.time_ref is not None
             step = 1 << 16
             with open(part, "w", encoding="utf-8", newline="") as fh:
                 fh.write(",".join(_csv_cell(h) for h in req.header) + "\n")
@@ -909,16 +1111,21 @@ class DataEngine(QObject):
                         else:
                             idx = sel[r0:a1]
                         raw = self._read(st, int(idx[0]), int(idx[-1]) + 1)
-                        blocks.append((idx, it.xmap.index_to_x(idx), raw[idx - idx[0]]))
+                        xs = it.xmap.index_to_x(idx)
+                        times = iso_times(req.time_ref, xs) if timed and it.cid in req.time_cids else None
+                        blocks.append((idx, xs, raw[idx - idx[0]], times))
                     lines = []
+                    empty = ["", "", "", ""] if timed else ["", "", ""]
                     for k in range(r1 - r0):
                         cells = []
                         for blk in blocks:
                             if blk is not None and k < blk[0].size:
-                                cells += [str(int(blk[0][k])), repr(float(blk[1][k])),
-                                          _csv_cell(format_export(blk[2][k]))]
+                                cells += [str(int(blk[0][k])), repr(float(blk[1][k]))]
+                                if timed:
+                                    cells.append(blk[3][k] if blk[3] is not None else "")
+                                cells.append(_csv_cell(format_export(blk[2][k])))
                             else:
-                                cells += ["", "", ""]
+                                cells += empty
                         lines.append(",".join(cells))
                     fh.write("\n".join(lines) + "\n")
                     self.progress.emit(gen, min(0.999, r1 / max(1, rows)), "Exporting CSV")
@@ -935,6 +1142,28 @@ class DataEngine(QObject):
                     os.remove(part)
                 except OSError:
                     pass
+
+
+_NS_SAFE_S = 9_000_000_000  # |Unix seconds| that fit datetime64[ns] with margin
+
+
+def iso_times(t_ref, x) -> list[str]:
+    """UTC ISO 8601 texts of t_ref + x (x: seconds, float64), exact to 1 ns.
+
+    t_ref is a TimeRef (whole Unix seconds + fraction), so the sum keeps
+    ns resolution. Non-finite x or dates outside 1685..2255 give "".
+    """
+    t_ref = TimeRef.of(t_ref)
+    f = t_ref.frac + np.asarray(x, dtype=np.float64)
+    with np.errstate(invalid="ignore"):
+        w = np.floor(f)
+        ok = np.isfinite(f) & (np.abs(w + t_ref.sec) < _NS_SAFE_S)
+    f = np.where(ok, f, 0.0)
+    w = np.where(ok, w, 0.0)
+    ns = np.rint((f - w) * 1e9).astype(np.int64)  # 1e9 carries into the seconds below
+    t = ((t_ref.sec + w.astype(np.int64)) * 1_000_000_000 + ns).astype("datetime64[ns]")
+    text = np.datetime_as_string(t, unit="ns")
+    return [s + "Z" if good else "" for s, good in zip(text.tolist(), ok.tolist())]
 
 
 def absolute_stats(res: dict):
