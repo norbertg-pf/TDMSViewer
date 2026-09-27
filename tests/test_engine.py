@@ -1673,3 +1673,50 @@ def test_xy_point_budget_is_per_request(drv, main_file, monkeypatch):
     out = drv.plot([PlotItem(c, amap, 0, N) for c in cids], 0.0, 1.0, 300)
     total = sum(r[0].size for r in out.values())
     assert total <= 40_000 + 4 * 2 * (N // 10_000 + 1)
+
+
+# -- fragmented files: channels of one family load in one pass -------------------------------
+
+@pytest.mark.parametrize("ram_mb", ["2048", "0"], ids=["ram", "disk"])
+def test_fragmented_family_loads_in_one_pass(new_driver, tmp_path, monkeypatch, ram_mb):
+    """300 small segments: 3 channels load together; values, pyramids and stats stay exact."""
+    from nptdms import ChannelObject, TdmsWriter
+
+    monkeypatch.setenv("TDMSVIEWER_RAM_MB", ram_mb)
+    rng = np.random.default_rng(7)
+    n_seg, npc = 300, 100
+    data = {"a": rng.normal(size=n_seg * npc),
+            "b": rng.integers(-1000, 1000, n_seg * npc).astype(np.int32),
+            "c": rng.normal(size=n_seg * npc).astype(np.float32)}
+    data["a"][12_345] = 99.0  # spike
+    path = tmp_path / "frag.tdms"
+    with TdmsWriter(str(path)) as w:
+        for k in range(n_seg):
+            w.write_segment([ChannelObject("G", nm, v[k * npc:(k + 1) * npc]) for nm, v in data.items()])
+    calls = []
+    orig = eng_mod.DataEngine._load_family
+
+    def spy(self, gen, src, group, builds, prog):
+        calls.append(sorted(st.info.name for st in group))
+        yield from orig(self, gen, src, group, builds, prog)
+
+    monkeypatch.setattr(eng_mod.DataEngine, "_load_family", spy)
+    drv = new_driver()
+    gen, model = drv.open(path)
+    assert calls == [["a", "b", "c"]]
+    n = n_seg * npc
+    for st in drv.eng._stores:
+        ref = data[st.info.name]
+        assert st.done and st.fast is not None and st.fast.fragmented
+        assert st.pyr is not None and st.pyr.complete
+        if ram_mb == "0":
+            assert st.ram is None
+        else:
+            np.testing.assert_array_equal(st.ram, ref)
+        xm = LinearMap(0.0, 1.0)
+        res = drv.plot([PlotItem(st.info.id, xm, 0, n)], 0.0, n - 1.0, 300)
+        check_plot(res[st.info.id], ref.astype(np.float64), xm, 0.0, n - 1.0, 300)
+        s = absolute_stats(drv.stats([PlotItem(st.info.id, xm, 0, n)], 0.0, n - 1.0)[st.info.id])
+        f = ref.astype(np.float64)
+        assert (s.n, s.min, s.max) == (n, f.min(), f.max())
+        assert math.isclose(s.mean, f.mean(), rel_tol=1e-12, abs_tol=1e-12)

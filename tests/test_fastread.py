@@ -321,10 +321,14 @@ CORRUPTIONS = ["offset_item", "offset_byte", "offset_back", "byte_order", "chunk
                "item_stride", "start"]
 
 
+@pytest.mark.parametrize("api_check", [True, False], ids=["api", "probes_only"])
 @pytest.mark.parametrize("kind", CORRUPTIONS)
 @pytest.mark.parametrize("name,channel", [("chunks", "small_a"), ("chunks", "small_b"),
                                           ("interleaved", "c_i2"), ("mixed", "m_f8"), ("raw_only", "a")])
-def test_verification_rejects_corrupted_layout(kind, name, channel, scenario, opened, monkeypatch):
+def test_verification_rejects_corrupted_layout(kind, name, channel, api_check, scenario, opened, monkeypatch):
+    """probes_only: the npTDMS end-to-end check is off (large files); the probes alone must catch it."""
+    if not api_check:
+        monkeypatch.setattr(fastread, "_API_CHECK_MAX_BYTES", -1)
     path, builder, notes = scenario(name)
     o = opened(path)
     ch = o.channel(obj_path("Group", channel))
@@ -333,8 +337,8 @@ def test_verification_rejects_corrupted_layout(kind, name, channel, scenario, op
     if bad == parts:
         pytest.skip("corruption does not change this layout")
     # A corruption that happens to give the same values is not a real corruption.
-    probe = fastread.FastChannelReader(o.fd, bad, len(ch), base)
     try:
+        probe = fastread.FastChannelReader(o.fd, bad, len(ch), base)
         same = probe.read(0, len(ch)).tobytes() == o.ref_data(ch).tobytes()
     except Exception:
         same = False
@@ -370,15 +374,13 @@ def test_verification_checks_every_segment_kind(write_tdms, opened, rng, monkeyp
         make_fast_reader(o.tdms, ch, o.fd)
 
 
-def test_verification_windows_cover_joints():
-    parts = [fastread._Part(s, 100, 0, 100, 0, 8, np.dtype("<f8")) for s in range(0, 1000, 100)]
-    ws = fastread._windows(1000, parts)
-    for a, b in ws:
-        assert 0 <= a < b <= 1000
-    covered = set()
-    for a, b in ws:
-        covered.update(range(a, b))
-    assert {0, 999, 100, 500, 900, 99, 499, 899}.issubset(covered)
+def test_probe_picks_cover_ends_and_every_kind():
+    sig = np.array([0, 0, 1, 0, 2, 2, 0, 0, 0, 3])
+    picks = fastread._pick(sig)
+    assert {0, 9, 2, 4, 5, 8}.issubset(picks)  # ends, first and last of kinds 1, 2, 0
+    assert all(0 <= p < sig.size for p in picks)
+    many = np.arange(10_000) % 1000  # 1000 kinds: bounded number of picks
+    assert len(fastread._pick(many)) <= 2 * fastread._MAX_KINDS + fastread._SPREAD_RUNS + 2
 
 
 def test_file_shrinking_after_open_gives_clean_error(scenario, opened, tmp_path):
@@ -417,3 +419,180 @@ def test_empty_channel_reader(write_tdms, opened):
     reader = make_fast_reader(o.tdms, ch, o.fd)
     assert reader.length == 0
     assert reader.read(0, 10).shape == (0,)
+
+
+# -- one-pass layout, merged runs, families ---------------------------------------------------
+
+def _all_channels(o):
+    return [c for g in o.tdms.groups() for c in g.channels()]
+
+
+def test_regular_segments_merge_into_one_part(write_tdms, opened, rng):
+    """200 equal raw segments: one part per channel (plus the first segment)."""
+    b = TdmsBuilder()
+    pa, pb = obj_path("G", "a"), obj_path("G", "b")
+    b.segment(tb.header_objects(["G"]) + [Obj(pa, tb.random_values("f8", 100, rng)),
+                                          Obj(pb, tb.random_values("i2", 100, rng))])
+    for _ in range(200):
+        b.raw_segment({pa: tb.random_values("f8", 100, rng), pb: tb.random_values("i2", 100, rng)})
+    o = opened(write_tdms(b))
+    for p in (pa, pb):
+        ch = o.channel(p)
+        reader = make_fast_reader(o.tdms, ch, o.fd)
+        assert reader.n_parts <= 2
+        parts, _ = build_parts(o.tdms, ch)
+        assert parts[-1].count >= 200 * 100 - 100 and parts[-1].npc == 100
+        check_reader(reader, o.ref_data(ch), rng, [q.start for q in parts], p)
+
+
+def test_irregular_segments_split_runs(write_tdms, opened, rng):
+    """A segment of other size breaks a run; all values stay right."""
+    b = TdmsBuilder()
+    p = obj_path("G", "x")
+    b.segment(tb.header_objects(["G"]) + [Obj(p, tb.random_values("f8", 64, rng))])
+    for k in range(30):
+        n = 64 if k != 12 else 80
+        b.segment([Obj(p, tb.random_values("f8", n, rng))], new_obj_list=False)
+    for _ in range(5):
+        b.raw_segment({p: tb.random_values("f8", 64, rng)})
+    o = opened(write_tdms(b))
+    ch = o.channel(p)
+    reader = make_fast_reader(o.tdms, ch, o.fd)
+    assert 2 < reader.n_parts < 10
+    parts, _ = build_parts(o.tdms, ch)
+    check_reader(reader, o.ref_data(ch), rng, [q.start for q in parts], p)
+
+
+@pytest.mark.parametrize("name", FAST_SCENARIOS)
+def test_read_many_matches_single_reads(name, scenario, opened, rng):
+    path, builder, notes = scenario(name)
+    o = opened(path)
+    chans = _all_channels(o)
+    made = fastread.make_fast_readers(o.tdms, chans, o.fd)
+    fam: dict = {}
+    for ch, r in zip(chans, made):
+        if notes["fast"].get(ch.path):
+            assert isinstance(r, fastread.FastChannelReader), (ch.path, r)
+        if isinstance(r, fastread.FastChannelReader):
+            fam.setdefault(r.family, []).append((ch, r))
+    assert fam
+    for members in fam.values():
+        n = members[0][1].length
+        assert all(r.length == n for _c, r in members)
+        refs = [o.ref_data(c) for c, _r in members]
+        for a, b in tb.windows(n, rng, count=25):
+            outs = fastread.read_many([r for _c, r in members], a, b)
+            lo, hi = tb.clamp_window(n, a, b)
+            for (c, _r), got, ref in zip(members, outs, refs):
+                tb.assert_same_values(got, ref[lo:hi], f"{name} {c.path} [{a}, {b})")
+
+
+@pytest.mark.parametrize("block", [8, 100, 1 << 20])
+def test_read_many_small_blocks_and_gaps(block, scenario, opened, rng, monkeypatch):
+    monkeypatch.setattr(fastread, "_BLOCK_BYTES", block)
+    files = [(name, opened(scenario(name)[0])) for name in ("chunks", "interleaved", "mixed", "growing")]
+    for gap in (0, 1 << 40):
+        monkeypatch.setattr(fastread, "_GAP_READ_MIN", gap)
+        for name, o in files:
+            chans = _all_channels(o)
+            made = fastread.make_fast_readers(o.tdms, chans, o.fd)
+            for ch, r in zip(chans, made):
+                if isinstance(r, fastread.FastChannelReader):
+                    check_reader(r, o.ref_data(ch), rng, msg=f"{name} {ch.path} gap={gap}")
+            readers = [r for r in made if isinstance(r, fastread.FastChannelReader)]
+            n = min(r.length for r in readers)
+            for r, got in zip(readers, fastread.read_many(readers, 0, n)):
+                assert got.tobytes() == r.read(0, n).tobytes()
+
+
+def test_verification_cost_is_bounded_for_large_chunks(write_tdms, opened, rng, monkeypatch):
+    """One chunk of 2 x 1M values: npTDMS decodes only probe values, not 16 MB."""
+    b = TdmsBuilder()
+    pa, pb = obj_path("G", "a"), obj_path("G", "b")
+    b.segment(tb.header_objects(["G"]) + [Obj(pa, tb.random_values("f8", 1 << 20, rng)),
+                                          Obj(pb, tb.random_values("f8", 1 << 20, rng))])
+    o = opened(write_tdms(b))
+    got_bytes = [0]
+    orig = fastread._LimitedFile.readinto
+
+    def counting(self, buf):
+        n = orig(self, buf)
+        got_bytes[0] += n
+        return n
+
+    monkeypatch.setattr(fastread._LimitedFile, "readinto", counting)
+
+    def no_api(*_a):
+        raise AssertionError("end-to-end read must be skipped for large chunks")
+
+    made = fastread.make_fast_readers(o.tdms, _all_channels(o), o.fd, no_api)
+    assert all(isinstance(r, fastread.FastChannelReader) for r in made)
+    assert 0 < got_bytes[0] <= 64 * 1024
+    assert made[0].family == made[1].family
+
+
+def test_limited_file_stops_after_limit(tmp_path):
+    p = tmp_path / "x.bin"
+    p.write_bytes(bytes(range(256)) * 4)
+    with open(p, "rb", buffering=0) as fh:
+        lf = fastread._LimitedFile(fh, 10)
+        lf.seek(5)
+        buf = bytearray(64)
+        assert lf.readinto(buf) == 10 and bytes(buf[:10]) == bytes(range(5, 15))
+        assert lf.readinto(buf) == 0
+        lf.seek(0)  # a seek gives a new budget
+        assert lf.read() == bytes(range(10))
+
+
+def _fuzz_builder(rng):
+    """Random file: channels come and go, chunk counts, interleaved, big endian, raw-only runs."""
+    b = TdmsBuilder()
+    names = [f"c{i}" for i in range(int(rng.integers(1, 6)))]
+    kinds = ("f8", "f4", "i2", "i4", "i8", "u1", "u4", "?")  # no complex: npTDMS cannot read it interleaved
+    dt = {n: kinds[int(rng.integers(0, len(kinds)))] for n in names}
+    path = {n: obj_path("G", n) for n in names}
+    cur: dict = {}
+    for s in range(int(rng.integers(1, 40))):
+        chunks = int(rng.integers(1, 4)) if rng.random() < 0.3 else 1
+        opts = dict(chunks=chunks, interleaved=bool(rng.random() < 0.15), big_endian=bool(rng.random() < 0.1))
+        mode = "new" if s == 0 else ("raw", "raw", "raw", "same", "new", "subset")[int(rng.integers(0, 6))]
+        if mode in ("raw", "same") and cur:
+            vals = {path[n]: tb.random_values(dt[n], k * chunks, rng) for n, k in cur.items()}
+            if mode == "raw":
+                b.raw_segment(vals, **opts)
+            else:
+                b.segment([Obj(p, v, index="same") for p, v in vals.items()], new_obj_list=False, **opts)
+            continue
+        npc = int(rng.integers(1, 300))
+        present = names if mode == "new" else [n for n in names if rng.random() < 0.6] or names[:1]
+        cur = {n: npc for n in present}
+        objs = [Obj(path[n], tb.random_values(dt[n], npc * chunks, rng)) for n in present]
+        b.segment((tb.header_objects(["G"]) if s == 0 else []) + objs, **opts)
+    return b
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_fuzz_layouts_against_nptdms(seed, write_tdms, opened, monkeypatch):
+    rng = np.random.default_rng(1000 + seed)
+    if seed % 2:
+        monkeypatch.setattr(fastread, "_GAP_READ_MIN", int(rng.integers(0, 4096)))
+        monkeypatch.setattr(fastread, "_BLOCK_BYTES", int(rng.integers(64, 8192)))
+    b = _fuzz_builder(rng)
+    cut = int(rng.integers(1, 200)) if seed % 5 == 4 else 0
+    o = opened(write_tdms(b, cut=cut))
+    chans = [c for c in _all_channels(o) if len(c)]
+    made = fastread.make_fast_readers(o.tdms, chans, o.fd)
+    fam: dict = {}
+    for ch, r in zip(chans, made):
+        if not cut:
+            assert isinstance(r, fastread.FastChannelReader), (seed, ch.path, r)
+        if isinstance(r, fastread.FastChannelReader):
+            check_reader(r, o.ref_data(ch), rng, msg=f"seed {seed} {ch.path}")
+            fam.setdefault(r.family, []).append((ch, r))
+    for members in fam.values():
+        n = members[0][1].length
+        for a, bb in tb.windows(n, rng, count=10):
+            outs = fastread.read_many([r for _c, r in members], a, bb)
+            lo, hi = tb.clamp_window(n, a, bb)
+            for (c, _r), got in zip(members, outs):
+                tb.assert_same_values(got, o.ref_data(c)[lo:hi], f"seed {seed} {c.path} [{a}, {bb})")

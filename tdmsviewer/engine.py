@@ -28,11 +28,13 @@ from dataclasses import dataclass, field
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
+from . import fastread
 from . import pyramid as pyr
 from .tdmsfile import KIND_BOOL, KIND_COMPLEX, KIND_INT, KIND_TIME, PLOTTABLE, ChannelInfo, TdmsSource
 from .xaxis import ArrayMap, LinearMap, TimeRef, is_monotonic
 
 BLOCK = 1 << 22  # samples per load step
+FAMILY_STEP_BYTES = 32 << 20  # bytes per load step when channels load together
 PYR_BASE_RAM = 256
 PYR_MIN_LEN = 4096  # no pyramid below this length (raw decimation is cheap)
 RAW_DECIMATE_MAX = 1 << 24  # max raw samples for statistics on demand
@@ -242,8 +244,8 @@ class DataEngine(QObject):
         self._file_warned = False
         self._stat_checked = 0.0
         self._priority: list[int] = []
-        self._pool = futures.ThreadPoolExecutor(max_workers=max(1, min(4, (os.cpu_count() or 2) - 2)),
-                                                thread_name_prefix="tdms-pyramid")
+        self._pool_workers = max(1, min(4, (os.cpu_count() or 2) - 2))
+        self._pool = futures.ThreadPoolExecutor(max_workers=self._pool_workers, thread_name_prefix="tdms-pyramid")
         self._thread = threading.Thread(target=self._run, name="tdms-engine", daemon=True)
         self._thread.start()
 
@@ -484,21 +486,34 @@ class DataEngine(QObject):
         chunk_ids = {s.info.id for s in chunk_pass}
         builds = self._builds
         remaining = dict.fromkeys(s.info.id for s in stores if s.info.id not in chunk_ids)
+        # Fragmented fast channels of one family load together: one file pass, not one per channel.
+        families: dict = {}
+        for s in stores:
+            if s.info.id in remaining and s.fast is not None and s.fast.fragmented and s.info.length:
+                families.setdefault((s.fast.family, s.to_ram), []).append(s)
         while remaining:
             pick = next((c for c in self._priority if c in remaining), None)
             if pick is None:
                 pick = next(iter(remaining))
-            del remaining[pick]
             st = stores[pick]
+            group = [st]
+            if st.fast is not None and st.fast.fragmented and st.info.length:
+                group = [s for s in families.get((st.fast.family, st.to_ram), ()) if s.info.id in remaining] or [st]
+            for s in group:
+                del remaining[s.info.id]
             before = prog.done
             try:
-                yield from self._load_channel(gen, src, st, builds, prog)
+                if len(group) > 1:
+                    yield from self._load_family(gen, src, group, builds, prog)
+                else:
+                    yield from self._load_channel(gen, src, st, builds, prog)
             except Exception as exc:  # one bad channel must not stop the others
-                st.done = True
+                for s in group:
+                    s.done = True
                 self.message.emit(gen, f"{st.info.label}: cannot read ({type(exc).__name__}: {exc})")
             if gen != self._stores_gen:
                 return
-            prog.done = before + st.info.length * _itemsize(st.info)
+            prog.done = before + sum(s.info.length * _itemsize(s.info) for s in group)
             yield
         if chunk_pass:
             try:
@@ -522,6 +537,76 @@ class DataEngine(QObject):
             self.message.emit(gen, w)
         self.progress.emit(gen, 1.0, f"Loaded {prog.total / 1e6:.1f} MB in {prog.elapsed():.2f} s")
 
+    @staticmethod
+    def _set_t0(src: TdmsSource, st: _Store) -> None:
+        """Integer origin of time and int64/uint64 channels (exact float64 offsets)."""
+        info = st.info
+        if info.kind == KIND_TIME and st.t0 is None:
+            st.t0 = _first_time(src.read(info.id, 0, min(info.length, 1024)))
+        elif _big_int(info) and st.t0 is None:
+            st.t0 = _int_zero(src.read(info.id, 0, 1))
+
+    def _load_family(self, gen: int, src: TdmsSource, group: list, builds: list, prog):
+        """Load fragmented fast channels of one family in one pass (generator).
+
+        RAM mode: the worker fills all arrays block by block. Disk mode:
+        helper threads stream the pyramids, each for a share of the channels.
+        """
+        n = group[0].info.length
+        for st in group:
+            self._set_t0(src, st)
+        readers = [st.fast for st in group]
+        row = sum(r.dtype.itemsize for r in readers)
+        base = max(st.base for st in group)
+        step = max(base, FAMILY_STEP_BYTES // row // base * base)
+        if group[0].to_ram:
+            arrs = [np.empty(n, dtype=st.info.dtype) for st in group]
+            label = f"Loading {len(group)} channels"
+            for i in range(0, n, step):
+                if gen != self._stores_gen:
+                    return
+                k = min(step, n - i)
+                fastread.read_many(readers, i, i + k, [a[i:i + k] for a in arrs])
+                prog.add(k * row, label)
+                yield
+            for st, arr in zip(group, arrs):
+                st.ram = arr
+                if st.info.plottable and n >= PYR_MIN_LEN:
+                    st.pyr = pyr.Pyramid(n, st.base)
+                    builds.append(self._pool.submit(self._build_pyramid, gen, st, arr))
+                else:
+                    st.done = True
+            self.channelsUpdated.emit(gen, [st.info.id for st in group if st.done])
+            return
+        streamed = [st for st in group if st.info.plottable and n >= PYR_MIN_LEN]
+        for st in group:
+            if st in streamed:
+                st.pyr = pyr.Pyramid(n, st.base)
+            else:
+                st.done = True  # read on demand only
+        threads = max(1, min(len(streamed), self._pool_workers))
+        for k in range(threads):
+            share = streamed[k::threads]
+            builds.append(self._pool.submit(self._stream_family, gen, share, step))
+        yield
+
+    def _stream_family(self, gen: int, sts: list, step: int) -> None:
+        """Helper thread: pyramids of several disk channels from one pass."""
+        readers = [st.fast for st in sts]
+        n = sts[0].info.length
+        bufs = [np.empty(min(n, step), dtype=r.dtype) for r in readers]
+        for i in range(0, n, step):
+            if gen != self._stores_gen or gen != self._gen:
+                return
+            k = min(step, n - i)
+            outs = fastread.read_many(readers, i, i + k, [b[:k] for b in bufs])
+            for st, blk in zip(sts, outs):
+                st.pyr.append(to_f64(blk, st.info.kind, st.t0))
+        for st in sts:
+            st.done = True
+        if gen == self._stores_gen:
+            self.channelsUpdated.emit(gen, [st.info.id for st in sts])
+
     def _load_channel(self, gen: int, src: TdmsSource, st: _Store, builds: list, prog):
         """Load one channel: RAM copy and/or pyramid (generator)."""
         info = st.info
@@ -529,10 +614,7 @@ class DataEngine(QObject):
         if n == 0:
             st.done = True
             return
-        if info.kind == KIND_TIME and st.t0 is None:
-            st.t0 = _first_time(src.read(info.id, 0, min(n, 1024)))
-        elif _big_int(info) and st.t0 is None:
-            st.t0 = _int_zero(src.read(info.id, 0, 1))
+        self._set_t0(src, st)
         want_pyr = info.plottable and n >= PYR_MIN_LEN
         label = f"Loading {info.label}"
         if st.to_ram:

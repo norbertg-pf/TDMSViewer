@@ -308,6 +308,7 @@ class TdmsSource:
         groups: list[GroupInfo] = []
         channels: list[ChannelInfo] = []
         starts = []
+        fast_map = self._make_fast_readers()
         for g in self._file.groups():
             ginfo = GroupInfo(g.name, _props(g.properties), [])
             for c in g.channels():
@@ -331,11 +332,11 @@ class TdmsSource:
                     wf_start_time=_time_prop(props, "wf_start_time"),
                 )
                 fast = None
-                if self._fd >= 0 and length and info.kind in (KIND_FLOAT, KIND_INT, KIND_BOOL, KIND_COMPLEX):
-                    try:
-                        fast = fastread.make_fast_reader(self._file, c, self._fd, nptdms_read)
-                    except Exception as exc:  # any doubt -> npTDMS
-                        _log.debug("fast path off for %s: %s", c.path, exc)
+                if length and info.kind in (KIND_FLOAT, KIND_INT, KIND_BOOL, KIND_COMPLEX):
+                    fast = fast_map.get(c.path)
+                    if not isinstance(fast, fastread.FastChannelReader):  # any doubt -> npTDMS
+                        if fast is not None:
+                            _log.debug("fast path off for %s: %s", c.path, fast)
                         fast = None
                 info.fast = fast is not None
                 if info.wf_start_time is not None:
@@ -354,6 +355,18 @@ class TdmsSource:
             channels=channels, t_ref=min(starts) if starts else None, n_segments=nseg,
             index_used=index_used,
         )
+
+    def _make_fast_readers(self) -> dict:
+        """Fast readers of all channels (one layout scan): path -> reader or exception."""
+        if self._fd < 0:
+            return {}
+        chans = [c for g in self._file.groups() for c in g.channels() if len(c)]
+        try:
+            made = fastread.make_fast_readers(self._file, chans, self._fd, nptdms_read)
+        except Exception as exc:  # any doubt -> npTDMS
+            _log.debug("fast path off: %s", exc)
+            return {}
+        return {c.path: r for c, r in zip(chans, made)}
 
     # -- data access (worker thread) --------------------------------------------
 
