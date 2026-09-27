@@ -11,6 +11,7 @@ import csv
 import math
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1615,3 +1616,60 @@ def test_real_flexlogger_file(drv, tmp_path, monkeypatch, ram_mb):
     assert [float(r[2]) for r in rows] == data["PXIe-4303 (PXI2Slot3)/V0"][k0:k1].tolist()
     assert [float(r[5]) for r in rows] == T[k0:k1].tolist()
     assert drv.rec.of("message", gen) == []
+
+
+# -- robustness of answers ---------------------------------------------------------
+
+def test_x_task_error_is_answered(drv, small_file, monkeypatch):
+    """A read error while loading X values gives an xReady error text (GUI falls back)."""
+    gen, model = drv.open(small_file.path)
+
+    def broken(self, st, i0, i1):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(DataEngine, "_read_f64", broken)
+    res = drv.xmap(0)
+    assert isinstance(res, str) and "disk gone" in res
+
+
+def test_open_error_after_metadata_gives_open_failed(new_driver, small_file, monkeypatch):
+    """An error after the metadata is read still ends in openFailed (never stuck at 'Opening')."""
+    d = new_driver()
+
+    def bad_budget():
+        raise ValueError("could not convert string to float: '1,5'")
+
+    monkeypatch.setattr(eng_mod, "ram_budget_bytes", bad_budget)
+    gen = d.eng.open(str(small_file.path))
+    g, msg = d.wait("openFailed", lambda g, m: g == gen)
+    assert "1,5" in msg
+    assert d.eng._source is None  # the file is closed again
+
+
+def test_file_changed_on_disk_is_reported(drv, tmp_path):
+    """A rewrite of the open file gives one clear warning (display can mix versions)."""
+    path = tmp_path / "live.tdms"
+    write_segments(path, [[("G", "a", np.zeros(5000), {})]])
+    gen, model = drv.open(path)
+    time.sleep(0.6)
+    write_segments(path, [[("G", "a", np.ones(5000), {})]])  # same name, new content
+    items = [PlotItem(0, LinearMap(0.0, 1.0), 0, 5000)]
+    drv.plot(items, 0, 5000, 100)
+    msgs = [m for g, m in drv.rec.of("message") if g == gen]
+    assert any("changed on disk" in m for m in msgs), msgs
+    drv.plot(items, 0, 2500, 100)
+    time.sleep(0.6)
+    drv.plot(items, 0, 5000, 100)
+    msgs = [m for g, m in drv.rec.of("message") if g == gen and "changed on disk" in m]
+    assert len(msgs) == 1  # reported once
+
+
+def test_xy_point_budget_is_per_request(drv, main_file, monkeypatch):
+    """Many X-Y curves share one point budget (no memory explosion)."""
+    monkeypatch.setattr(eng_mod, "XY_MAX_POINTS", 40_000)
+    gen, model = drv.open(main_file.path)
+    _, amap, _ = drv.xmap(main_file.ids["Wave/XY"])
+    cids = [main_file.ids[k] for k in ("Wave/sig", "Wave/offset", "Wave/f32", "Wave/i32")]
+    out = drv.plot([PlotItem(c, amap, 0, N) for c in cids], 0.0, 1.0, 300)
+    total = sum(r[0].size for r in out.values())
+    assert total <= 40_000 + 4 * 2 * (N // 10_000 + 1)

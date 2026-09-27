@@ -237,6 +237,10 @@ class DataEngine(QObject):
         self._tasks: list = []  # user tasks (generators): export, X values
         self._builds: list = []  # helper-thread futures of the current file
         self._raw_budget = RAW_PLOT_BUDGET
+        self._xy_points = XY_MAX_POINTS
+        self._file_stat = None  # (size, mtime, inode) at open: detect a rewrite
+        self._file_warned = False
+        self._stat_checked = 0.0
         self._priority: list[int] = []
         self._pool = futures.ThreadPoolExecutor(max_workers=max(1, min(4, (os.cpu_count() or 2) - 2)),
                                                 thread_name_prefix="tdms-pyramid")
@@ -351,7 +355,10 @@ class DataEngine(QObject):
                 if job is None and task is None:
                     self._bg = None
                 traceback.print_exc()
-                self.message.emit(self._stores_gen, f"Internal error: {exc}")
+                gen = self._stores_gen
+                if job is not None and isinstance(job[1], tuple) and job[1] and isinstance(job[1][0], int):
+                    gen = job[1][0]  # report to the file the job belongs to
+                self.message.emit(gen, f"Internal error: {exc}")
         self._close_source()
 
     def _pending(self, kind: str) -> bool:
@@ -417,7 +424,27 @@ class DataEngine(QObject):
             self._stores_gen = gen
             self.openFailed.emit(gen, f"{type(exc).__name__}: {exc}")
             return
+        try:
+            self._setup_file(gen, src, t)
+        except Exception as exc:  # never leave the GUI at "Opening ..."
+            traceback.print_exc()
+            self._close_source()
+            try:
+                src.close()
+            except Exception:
+                pass
+            self._stores_gen = gen
+            self.openFailed.emit(gen, f"{type(exc).__name__}: {exc}")
+
+    def _setup_file(self, gen: int, src: TdmsSource, t: float) -> None:
+        """Residency, stores and background load of a new file."""
         model = src.model
+        try:
+            st = os.stat(src.path)
+            self._file_stat = (st.st_size, st.st_mtime_ns, st.st_ino)
+        except OSError:
+            self._file_stat = None
+        self._file_warned = False
         # Residency: RAM for channels that fit the budget, in file order.
         budget = ram_budget_bytes()
         used = 0
@@ -612,6 +639,24 @@ class DataEngine(QObject):
 
     # -- reading helpers (worker) ---------------------------------------------------
 
+    def _check_file_changed(self, gen: int) -> None:
+        """Warn once if the open file was rewritten, replaced or grew (at most 2x per second)."""
+        if self._file_stat is None or self._file_warned or self._source is None:
+            return
+        now = time.monotonic()
+        if now - self._stat_checked < 0.5:
+            return
+        self._stat_checked = now
+        try:
+            st = os.stat(self._source.path)
+            cur = (st.st_size, st.st_mtime_ns, st.st_ino)
+        except OSError:
+            cur = None
+        if cur != self._file_stat:
+            self._file_warned = True
+            self.message.emit(gen, "The file was changed on disk after it was opened. The display can mix "
+                                   "old and new data. Press F5 to reload.")
+
     def _store(self, cid) -> _Store | None:
         """Store of a channel id, or None for an unknown id (also negative ids)."""
         if isinstance(cid, (int, np.integer)) and 0 <= cid < len(self._stores):
@@ -648,6 +693,10 @@ class DataEngine(QObject):
         out = {}
         px = max(16, int(req.pixels))
         self._raw_budget = RAW_PLOT_BUDGET
+        # X-Y plots: one point budget for the whole request, not per channel.
+        n_xy = sum(1 for it in req.items if isinstance(it.xmap, ArrayMap) and not it.xmap.monotonic)
+        self._xy_points = max(min(2_000, XY_MAX_POINTS), XY_MAX_POINTS // max(1, n_xy))
+        self._check_file_changed(gen)
         for it in req.items:
             if self._pending("plot"):
                 if out:  # a newer view exists: deliver what is done
@@ -675,7 +724,7 @@ class DataEngine(QObject):
         if isinstance(xmap, ArrayMap):
             e = min(e, xmap.x.size)
             if not xmap.monotonic:
-                return self._plot_xy(st, xmap, s, e)
+                return self._plot_xy(st, xmap, s, e, self._xy_points)
         i0, i1 = xmap.index_range(xa, xb, s, e)
         n = i1 - i0
         if n <= 0:
@@ -699,6 +748,13 @@ class DataEngine(QObject):
                 complete = False
         elif p is None and (n > self._raw_plot_max(st) * 8 or not self._take_raw_budget(st, n)):
             return None  # not loaded yet: drawn when channelsUpdated arrives
+        elif (p is not None and p.covered >= i1 and st.ram is None and st.fast is None
+              and n > self._raw_plot_max(st)):
+            # npTDMS-only channel on disk (DAQmx, scaled): a raw read would decode every
+            # channel of each segment. Draw the pyramid at its own resolution instead
+            # (exact min/max per bucket, a little coarser than one bucket per pixel).
+            c, mn, mx, miss = p.minmax(i0, i1, p.base, rr, with_missing=True)
+            complete = True
         else:
             # Bucket smaller than the pyramid base: n < base * px samples.
             c, mn, mx, miss = pyr.raw_minmax(self._read_f64(st, i0, i1), i0, b, with_missing=True)
@@ -725,7 +781,7 @@ class DataEngine(QObject):
             return RAW_PLOT_MAX * 4  # RAM: compute only, no I/O
         return RAW_PLOT_MAX if st.fast is not None else RAW_PLOT_MAX // 8
 
-    def _plot_xy(self, st: _Store, xmap: ArrayMap, s: int, e: int):
+    def _plot_xy(self, st: _Store, xmap: ArrayMap, s: int, e: int, max_points: int = XY_MAX_POINTS):
         n = e - s
         if n <= 0:
             return np.empty(0), np.empty(0), True
@@ -733,9 +789,9 @@ class DataEngine(QObject):
             return None
         y = self._read_f64(st, s, e)
         x = xmap.x[s:e]
-        if n <= XY_MAX_POINTS:
+        if n <= max_points:
             return x, y, True
-        b = -(-n // (XY_MAX_POINTS // 2))
+        b = -(-n // (max_points // 2))
         k = n // b
         body = y[: k * b].reshape(k, b)
         lo = np.where(np.isnan(body), np.inf, body).argmin(axis=1)
@@ -752,6 +808,7 @@ class DataEngine(QObject):
     # -- table ----------------------------------------------------------------------
 
     def _do_table(self, gen: int, req: TableRequest, kind: str = "table") -> None:
+        self._check_file_changed(gen)
         out = {}
         for cid in req.cids:
             if self._pending(kind):
@@ -771,6 +828,7 @@ class DataEngine(QObject):
     # -- statistics -----------------------------------------------------------------
 
     def _do_stats(self, gen: int, req: StatsRequest) -> None:
+        self._check_file_changed(gen)
         out = {}
         for it in req.items:
             if self._pending("stats"):
@@ -830,6 +888,14 @@ class DataEngine(QObject):
     # -- x channel ------------------------------------------------------------------
 
     def _x_task(self, gen: int, req: XRequest):
+        """Load a channel as X values; any error is answered (the GUI falls back)."""
+        try:
+            yield from self._x_task_body(gen, req)
+        except Exception as exc:
+            traceback.print_exc()
+            self.xReady.emit(gen, req.seq, f"Cannot read the X values: {type(exc).__name__}: {exc}")
+
+    def _x_task_body(self, gen: int, req: XRequest):
         """Load a channel as X values (task: one block per step, cancellable)."""
         st = self._store(req.cid)
         if st is None:
